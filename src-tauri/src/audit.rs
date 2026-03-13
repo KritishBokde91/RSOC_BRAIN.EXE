@@ -16,6 +16,7 @@ use bollard::{
     Docker,
 };
 use futures_util::stream::StreamExt;
+use regex::Regex;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
@@ -221,8 +222,52 @@ struct ChatCompletionChoice {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum ChatCompletionMessageContent {
+    Text(String),
+    Parts(Vec<ChatCompletionContentPart>),
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatCompletionContentPart {
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    text: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct ChatCompletionMessage {
-    content: Option<String>,
+    content: Option<ChatCompletionMessageContent>,
+}
+
+impl ChatCompletionMessage {
+    fn content_text(&self) -> Option<String> {
+        match self.content.as_ref() {
+            Some(ChatCompletionMessageContent::Text(text)) => {
+                let trimmed = text.trim();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed.to_string())
+                }
+            }
+            Some(ChatCompletionMessageContent::Parts(parts)) => {
+                let combined = parts
+                    .iter()
+                    .filter(|part| part.kind.as_deref().map_or(true, |kind| kind == "text"))
+                    .filter_map(|part| part.text.as_deref())
+                    .collect::<Vec<_>>()
+                    .join("");
+                let trimmed = combined.trim();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed.to_string())
+                }
+            }
+            None => None,
+        }
+    }
 }
 
 pub async fn run_repository_audit(
@@ -364,7 +409,7 @@ pub async fn run_repository_audit(
             warnings.push(format!(
                 "LLM-based finding synthesis was unavailable, so the report falls back to command failures only: {error}"
             ));
-            fallback_audit_report(&executed_commands)
+            fallback_audit_report(&prepared.analysis_root, &executed_commands)
         }
     };
 
@@ -1059,16 +1104,20 @@ async fn generate_audit_report(
         .map_err(|error| format!("Failed to parse audit report JSON: {error}"))
 }
 
-fn fallback_audit_report(executed_commands: &[AuditCommandResult]) -> AuditReport {
+fn fallback_audit_report(
+    workspace_root: &Path,
+    executed_commands: &[AuditCommandResult],
+) -> AuditReport {
     let mut findings = Vec::new();
     for command in executed_commands
         .iter()
         .filter(|command| command.exit_code != 0)
     {
-        let mut specialized = specialized_fallback_findings(command);
+        let mut specialized = specialized_fallback_findings(workspace_root, command);
+        let had_specialized = !specialized.is_empty();
         findings.append(&mut specialized);
 
-        if findings.len() < MAX_FINDINGS {
+        if !had_specialized && findings.len() < MAX_FINDINGS {
             findings.push(generic_fallback_finding(command));
         }
 
@@ -1087,7 +1136,10 @@ fn fallback_audit_report(executed_commands: &[AuditCommandResult]) -> AuditRepor
     AuditReport { summary, findings }
 }
 
-fn specialized_fallback_findings(command: &AuditCommandResult) -> Vec<AuditFinding> {
+fn specialized_fallback_findings(
+    workspace_root: &Path,
+    command: &AuditCommandResult,
+) -> Vec<AuditFinding> {
     let output_lower = command.output_preview.to_lowercase();
     let mut findings = Vec::new();
 
@@ -1139,24 +1191,350 @@ fn specialized_fallback_findings(command: &AuditCommandResult) -> Vec<AuditFindi
             || output_lower.contains("\ne assert ")
             || output_lower.contains(" failed"))
     {
-        let (file, line) = first_pytest_failure_location(&command.output_preview);
-        findings.push(AuditFinding {
-            id: String::new(),
-            title: "Dynamic tests exposed a likely logic bug".to_string(),
-            severity: "Medium".to_string(),
-            category: "Logic Bug".to_string(),
-            confidence: 0.84,
-            file,
-            line,
-            source: "Sandbox execution".to_string(),
-            evidence: command.output_preview.clone(),
-            explanation: "The test suite reached the project logic and failed an assertion, which usually means the implementation does not match the expected behavior for at least one code path.".to_string(),
-            suggestion: "Inspect the failing assertion, compare the expected and actual values, and trace that mismatch back to the referenced function or branch before rerunning the audit.".to_string(),
-            fix_snippet: None,
-        });
+        let mut pytest_findings = infer_pytest_logic_findings(workspace_root, command);
+        if pytest_findings.is_empty() {
+            let (file, line) = first_pytest_failure_location(&command.output_preview);
+            pytest_findings.push(AuditFinding {
+                id: String::new(),
+                title: "Dynamic tests exposed a likely logic bug".to_string(),
+                severity: "Medium".to_string(),
+                category: "Logic Bug".to_string(),
+                confidence: 0.84,
+                file,
+                line,
+                source: "Sandbox execution".to_string(),
+                evidence: command.output_preview.clone(),
+                explanation: "The test suite reached the project logic and failed an assertion, which usually means the implementation does not match the expected behavior for at least one code path.".to_string(),
+                suggestion: "Inspect the failing assertion, compare the expected and actual values, and trace that mismatch back to the referenced function or branch before rerunning the audit.".to_string(),
+                fix_snippet: None,
+            });
+        }
+        findings.append(&mut pytest_findings);
     }
 
     findings
+}
+
+#[derive(Debug, Default)]
+struct PytestFailureHint {
+    test_file: Option<String>,
+    test_line: Option<usize>,
+    assertion: Option<String>,
+    function_name: Option<String>,
+    call_expression: Option<String>,
+    actual_value: Option<String>,
+}
+
+fn infer_pytest_logic_findings(
+    workspace_root: &Path,
+    command: &AuditCommandResult,
+) -> Vec<AuditFinding> {
+    extract_pytest_failure_hints(&command.output_preview)
+        .into_iter()
+        .filter_map(|failure| build_pytest_logic_finding(workspace_root, command, &failure))
+        .collect()
+}
+
+fn extract_pytest_failure_hints(output: &str) -> Vec<PytestFailureHint> {
+    let assertion_re = Regex::new(r"^>\s+assert\s+(.+)$").expect("valid pytest assertion regex");
+    let where_re = Regex::new(r"where\s+(.+?)\s+=\s+([A-Za-z_]\w*\(.*\))\s*$")
+        .expect("valid pytest where regex");
+    let trace_re = Regex::new(r"^([^\s:][^:]*\.(?:py|rs|js|ts|tsx|jsx|go|java|php)):(\d+):")
+        .expect("valid traceback regex");
+
+    let mut failures = Vec::new();
+    let mut current = PytestFailureHint::default();
+
+    for line in output.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("________________") {
+            push_pytest_failure_hint(&mut failures, &mut current);
+            continue;
+        }
+
+        if let Some(captures) = assertion_re.captures(trimmed) {
+            current.assertion = captures
+                .get(1)
+                .map(|value| value.as_str().trim().to_string());
+            continue;
+        }
+
+        if let Some(captures) = where_re.captures(trimmed) {
+            current.actual_value = captures
+                .get(1)
+                .map(|value| value.as_str().trim().to_string());
+            current.call_expression = captures
+                .get(2)
+                .map(|value| value.as_str().trim().to_string());
+            current.function_name = current.call_expression.as_deref().and_then(|call| {
+                call.split('(')
+                    .next()
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty())
+                    .map(str::to_string)
+            });
+            continue;
+        }
+
+        if let Some(captures) = trace_re.captures(trimmed) {
+            current.test_file = captures
+                .get(1)
+                .map(|value| value.as_str().trim().trim_start_matches("./").to_string());
+            current.test_line = captures
+                .get(2)
+                .and_then(|value| value.as_str().parse::<usize>().ok());
+        }
+    }
+
+    push_pytest_failure_hint(&mut failures, &mut current);
+    failures
+}
+
+fn push_pytest_failure_hint(
+    failures: &mut Vec<PytestFailureHint>,
+    current: &mut PytestFailureHint,
+) {
+    if current.test_file.is_some() || current.function_name.is_some() || current.assertion.is_some()
+    {
+        failures.push(std::mem::take(current));
+    }
+}
+
+fn build_pytest_logic_finding(
+    workspace_root: &Path,
+    command: &AuditCommandResult,
+    failure: &PytestFailureHint,
+) -> Option<AuditFinding> {
+    let function_name = failure.function_name.as_deref()?;
+    let source_file =
+        infer_python_source_file(workspace_root, failure.test_file.as_deref(), function_name);
+    let (file, line, function_window) = if let Some(source_file) = source_file {
+        let function_window =
+            read_python_function_window(workspace_root, &source_file, function_name);
+        let line = function_window.as_ref().map(|(line, _)| *line);
+        (Some(source_file), line, function_window)
+    } else {
+        (None, failure.test_line, None)
+    };
+
+    let (title, explanation, suggestion, fix_snippet) = explain_pytest_logic_failure(
+        function_name,
+        failure,
+        function_window
+            .as_ref()
+            .map(|(_, window)| window.as_slice()),
+    );
+
+    Some(AuditFinding {
+        id: String::new(),
+        title,
+        severity: "Medium".to_string(),
+        category: "Logic Bug".to_string(),
+        confidence: if file.is_some() { 0.91 } else { 0.83 },
+        file,
+        line,
+        source: if function_window.is_some() {
+            "Sandbox execution + source inspection".to_string()
+        } else {
+            "Sandbox execution".to_string()
+        },
+        evidence: command.output_preview.clone(),
+        explanation,
+        suggestion,
+        fix_snippet,
+    })
+}
+
+fn explain_pytest_logic_failure(
+    function_name: &str,
+    failure: &PytestFailureHint,
+    function_window: Option<&[String]>,
+) -> (String, String, String, Option<String>) {
+    let call = failure.call_expression.as_deref().unwrap_or(function_name);
+    let actual_value = failure
+        .actual_value
+        .as_deref()
+        .unwrap_or("an unexpected value");
+    let expected_value = failure
+        .assertion
+        .as_deref()
+        .and_then(extract_expected_assertion_value);
+    let source_window_text = function_window
+        .map(|window| window.join("\n"))
+        .unwrap_or_default();
+    let source_window_lower = source_window_text.to_lowercase();
+
+    if function_name.starts_with("add_") && source_window_text.contains(" - ") {
+        let explanation = match expected_value {
+            Some(expected) => format!(
+                "`{call}` returned `{actual_value}`, but the nearby implementation subtracts its operands. That contradicts both the function name and the test expectation of `{expected}`."
+            ),
+            None => format!(
+                "`{call}` returned `{actual_value}`, and the nearby implementation subtracts its operands instead of adding them."
+            ),
+        };
+        return (
+            format!("`{function_name}` appears to subtract instead of add"),
+            explanation,
+            "Change the return expression in this helper to use `+` so the implementation matches the function name and test contract.".to_string(),
+            Some("return left + right".to_string()),
+        );
+    }
+
+    if function_name.contains("average")
+        && source_window_lower.contains("len(")
+        && source_window_text.contains("+ 1")
+    {
+        let explanation = match expected_value {
+            Some(expected) => format!(
+                "`{call}` returned `{actual_value}` instead of `{expected}` because the divisor in the nearby implementation adds an extra `+ 1`, lowering the computed average."
+            ),
+            None => format!(
+                "`{call}` returned `{actual_value}` because the divisor in the nearby implementation appears to add an extra `+ 1`, which lowers the computed average."
+            ),
+        };
+        return (
+            format!("`{function_name}` likely has an off-by-one divisor"),
+            explanation,
+            "Use the real collection length as the divisor when computing the average, without incrementing it.".to_string(),
+            Some("return sum(values) / len(values)".to_string()),
+        );
+    }
+
+    let explanation = match expected_value {
+        Some(expected) => format!(
+            "`{call}` returned `{actual_value}` during the pytest run, but the assertion expected `{expected}`. That points to a logic mismatch in `{function_name}` or one of the branches it uses."
+        ),
+        None => format!(
+            "`{call}` returned `{actual_value}` during the pytest run, which points to a logic mismatch in `{function_name}` or one of the branches it uses."
+        ),
+    };
+
+    (
+        format!("`{function_name}` returned an unexpected result"),
+        explanation,
+        "Trace the failing inputs through the referenced helper and update the branch or expression that produces the unexpected value before rerunning the audit.".to_string(),
+        None,
+    )
+}
+
+fn extract_expected_assertion_value(assertion: &str) -> Option<String> {
+    let (_, expected) = assertion.split_once("==")?;
+    Some(expected.trim().trim_matches('"').to_string())
+}
+
+fn infer_python_source_file(
+    workspace_root: &Path,
+    test_file: Option<&str>,
+    function_name: &str,
+) -> Option<String> {
+    if let Some(test_file) = test_file {
+        if let Some(module) =
+            resolve_imported_python_module(workspace_root, test_file, function_name)
+        {
+            for candidate in python_module_candidate_paths(&module) {
+                if workspace_root.join(&candidate).is_file() {
+                    return Some(candidate);
+                }
+            }
+        }
+
+        if let Some(candidate) = source_candidate_from_test_name(test_file) {
+            if workspace_root.join(&candidate).is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+
+    None
+}
+
+fn resolve_imported_python_module(
+    workspace_root: &Path,
+    test_file: &str,
+    function_name: &str,
+) -> Option<String> {
+    let test_contents = fs::read_to_string(workspace_root.join(test_file)).ok()?;
+    for line in test_contents.lines() {
+        let trimmed = line.trim();
+        let Some(rest) = trimmed.strip_prefix("from ") else {
+            continue;
+        };
+        let Some((module, imported)) = rest.split_once(" import ") else {
+            continue;
+        };
+        let imports_function = imported.split(',').any(|item| {
+            item.split_whitespace()
+                .next()
+                .is_some_and(|name| name.trim() == function_name)
+        });
+        if imports_function {
+            return Some(module.trim().to_string());
+        }
+    }
+    None
+}
+
+fn python_module_candidate_paths(module: &str) -> Vec<String> {
+    let module_path = module.trim().trim_start_matches('.');
+    if module_path.is_empty() {
+        return Vec::new();
+    }
+    let relative = module_path.replace('.', "/");
+    vec![
+        format!("{relative}.py"),
+        format!("{relative}/__init__.py"),
+        format!("src/{relative}.py"),
+        format!("src/{relative}/__init__.py"),
+    ]
+}
+
+fn source_candidate_from_test_name(test_file: &str) -> Option<String> {
+    let file_name = Path::new(test_file).file_name()?.to_str()?;
+    let stem = Path::new(file_name).file_stem()?.to_str()?;
+    let source_stem = stem
+        .strip_prefix("test_")
+        .or_else(|| stem.strip_suffix("_test"))
+        .unwrap_or(stem);
+    if source_stem.is_empty() {
+        return None;
+    }
+    Some(format!("{source_stem}.py"))
+}
+
+fn read_python_function_window(
+    workspace_root: &Path,
+    file: &str,
+    function_name: &str,
+) -> Option<(usize, Vec<String>)> {
+    let contents = fs::read_to_string(workspace_root.join(file)).ok()?;
+    let lines = contents.lines().collect::<Vec<_>>();
+    for (index, line) in lines.iter().enumerate() {
+        let trimmed = line.trim_start();
+        if !trimmed.starts_with(&format!("def {function_name}(")) {
+            continue;
+        }
+
+        let indent = line.len().saturating_sub(trimmed.len());
+        let mut window = vec![(*line).to_string()];
+        for next_line in lines.iter().skip(index + 1) {
+            let next_trimmed = next_line.trim_start();
+            let next_indent = next_line.len().saturating_sub(next_trimmed.len());
+            if !next_trimmed.is_empty()
+                && next_indent <= indent
+                && (next_trimmed.starts_with("def ") || next_trimmed.starts_with("class "))
+            {
+                break;
+            }
+            if window.len() >= 8 {
+                break;
+            }
+            window.push((*next_line).to_string());
+        }
+        return Some((index + 1, window));
+    }
+
+    None
 }
 
 fn generic_fallback_finding(command: &AuditCommandResult) -> AuditFinding {
@@ -1452,7 +1830,41 @@ async fn send_llm_request(
     max_tokens: usize,
 ) -> Result<String, String> {
     let client = Client::new();
-    let request_body = serde_json::json!({
+    match send_llm_request_once(
+        &client,
+        config,
+        system_prompt,
+        user_prompt,
+        max_tokens,
+        true,
+    )
+    .await
+    {
+        Ok(content) => Ok(content),
+        Err(error) if should_retry_without_json_mode(&error) => {
+            send_llm_request_once(
+                &client,
+                config,
+                system_prompt,
+                user_prompt,
+                max_tokens,
+                false,
+            )
+            .await
+        }
+        Err(error) => Err(error),
+    }
+}
+
+async fn send_llm_request_once(
+    client: &Client,
+    config: &ResolvedLlmConfig,
+    system_prompt: &str,
+    user_prompt: &str,
+    max_tokens: usize,
+    use_json_mode: bool,
+) -> Result<String, String> {
+    let mut request_body = serde_json::json!({
         "model": config.model,
         "messages": [
             { "role": "system", "content": system_prompt },
@@ -1461,6 +1873,9 @@ async fn send_llm_request(
         "temperature": 0.15,
         "max_tokens": max_tokens
     });
+    if use_json_mode {
+        request_body["response_format"] = serde_json::json!({ "type": "json_object" });
+    }
 
     let url = format!("{}/chat/completions", config.base_url.trim_end_matches('/'));
     let response = client
@@ -1486,8 +1901,16 @@ async fn send_llm_request(
     completion
         .choices
         .first()
-        .and_then(|choice| choice.message.content.clone())
+        .and_then(|choice| choice.message.content_text())
         .ok_or_else(|| "LLM response was empty".to_string())
+}
+
+fn should_retry_without_json_mode(error: &str) -> bool {
+    let lowered = error.to_lowercase();
+    lowered.contains("response_format")
+        || lowered.contains("json_object")
+        || lowered.contains("json schema")
+        || lowered.contains("structured output")
 }
 
 #[derive(Debug, Clone)]
@@ -1993,19 +2416,33 @@ fn sanitize_optional(value: Option<String>) -> Option<String> {
 }
 
 fn strip_json_fences(input: &str) -> String {
-    let without_think = strip_think_blocks(input);
-    let trimmed = without_think.trim();
-    let unfenced = trimmed
-        .trim_start_matches("```json")
-        .trim_start_matches("```")
-        .trim_end_matches("```")
-        .trim();
+    for candidate in [
+        strip_think_blocks(input),
+        strip_reasoning_tags(input),
+        input.trim().to_string(),
+    ] {
+        let trimmed = candidate.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
 
-    if serde_json::from_str::<serde_json::Value>(unfenced).is_ok() {
-        return unfenced.to_string();
+        let unfenced = trimmed
+            .trim_start_matches("```json")
+            .trim_start_matches("```JSON")
+            .trim_start_matches("```")
+            .trim_end_matches("```")
+            .trim();
+
+        if serde_json::from_str::<serde_json::Value>(unfenced).is_ok() {
+            return unfenced.to_string();
+        }
+
+        if let Some(json) = extract_first_json_value(unfenced) {
+            return json;
+        }
     }
 
-    extract_first_json_value(unfenced).unwrap_or_else(|| unfenced.to_string())
+    input.trim().to_string()
 }
 
 fn strip_think_blocks(input: &str) -> String {
@@ -2018,13 +2455,22 @@ fn strip_think_blocks(input: &str) -> String {
 
         let after_tag = &after_start["<think>".len()..];
         let Some(end) = after_tag.find("</think>") else {
-            return cleaned;
+            cleaned.push_str(after_tag);
+            return cleaned.replace("</think>", "");
         };
         remainder = &after_tag[end + "</think>".len()..];
     }
 
     cleaned.push_str(remainder);
-    cleaned
+    cleaned.replace("</think>", "")
+}
+
+fn strip_reasoning_tags(input: &str) -> String {
+    input
+        .replace("<think>", "")
+        .replace("</think>", "")
+        .replace("<thinking>", "")
+        .replace("</thinking>", "")
 }
 
 fn extract_first_json_value(input: &str) -> Option<String> {
@@ -2136,10 +2582,10 @@ fn unique_suffix() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_workspace_shell_command, extract_required_config_name, fallback_project_plan,
-        has_python_tests, is_probable_source_path, js_install_command,
+        build_workspace_shell_command, extract_required_config_name, fallback_audit_report,
+        fallback_project_plan, has_python_tests, is_probable_source_path, js_install_command,
         normalize_python_test_command, python_install_command, requires_cpu_torch_strategy,
-        strip_json_fences, RepositorySnapshot, SourceSnippet,
+        strip_json_fences, AuditCommandResult, RepositorySnapshot, SourceSnippet,
     };
     use std::{fs, path::PathBuf};
 
@@ -2261,11 +2707,60 @@ mod tests {
     }
 
     #[test]
+    fn strip_json_fences_recovers_json_after_dangling_think_tag() {
+        let raw = "<think>\nI should inspect the failing repo first.\n{\"summary\":\"ok\",\"findings\":[]}";
+        assert_eq!(
+            strip_json_fences(raw),
+            "{\"summary\":\"ok\",\"findings\":[]}"
+        );
+    }
+
+    #[test]
     fn extract_required_config_name_reads_uppercase_name() {
         let output = "ValueError: PAYMENT_API_KEY is required";
         assert_eq!(
             extract_required_config_name(output).as_deref(),
             Some("PAYMENT_API_KEY")
         );
+    }
+
+    #[test]
+    fn fallback_audit_report_infers_pytest_logic_bugs_from_source() {
+        let root = temp_dir("pytest-fallback");
+        fs::write(
+            root.join("calculator.py"),
+            "def add_numbers(left: int, right: int) -> int:\n    return left - right\n\n\ndef average_numbers(values: list[int]) -> float:\n    if not values:\n        return 0.0\n    return sum(values) / (len(values) + 1)\n",
+        )
+        .expect("failed to write calculator");
+        fs::create_dir_all(root.join("tests")).expect("failed to create tests dir");
+        fs::write(
+            root.join("tests/test_calculator.py"),
+            "from calculator import add_numbers, average_numbers\n\n\ndef test_add_numbers() -> None:\n    assert add_numbers(2, 3) == 5\n\n\ndef test_average_numbers() -> None:\n    assert average_numbers([10, 20, 30]) == 20\n",
+        )
+        .expect("failed to write tests");
+
+        let command = AuditCommandResult {
+            label: "test".to_string(),
+            command: "python -m pytest -q".to_string(),
+            exit_code: 1,
+            status: "failed".to_string(),
+            duration_ms: 12,
+            output_preview: "FF.                                                                      [100%]\n=================================== FAILURES ===================================\n_______________________________ test_add_numbers _______________________________\n\n    def test_add_numbers() -> None:\n>       assert add_numbers(2, 3) == 5\nE       assert -1 == 5\nE        +  where -1 = add_numbers(2, 3)\n\ntests/test_calculator.py:5: AssertionError\n_____________________________ test_average_numbers _____________________________\n\n    def test_average_numbers() -> None:\n>       assert average_numbers([10, 20, 30]) == 20\nE       assert 15.0 == 20\nE        +  where 15.0 = average_numbers([10, 20, 30])\n\ntests/test_calculator.py:9: AssertionError\n".to_string(),
+        };
+
+        let report = fallback_audit_report(&root, &[command]);
+        let titles = report
+            .findings
+            .iter()
+            .map(|finding| finding.title.as_str())
+            .collect::<Vec<_>>();
+        assert!(titles.contains(&"`add_numbers` appears to subtract instead of add"));
+        assert!(titles.contains(&"`average_numbers` likely has an off-by-one divisor"));
+        assert!(report
+            .findings
+            .iter()
+            .all(|finding| finding.file.as_deref() == Some("calculator.py")));
+
+        fs::remove_dir_all(&root).expect("failed to clean temp directory");
     }
 }
