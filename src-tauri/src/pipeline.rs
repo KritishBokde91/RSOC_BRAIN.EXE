@@ -365,14 +365,14 @@ async fn enrich_with_llm(
             "messages": [
                 {
                     "role": "system",
-                    "content": "You are AetherVerify, an expert security code analyst. For each vulnerability, provide:\n1. A confidence score (0.0-1.0) based on how likely this is a real exploitable vulnerability\n2. A corrected version of the code that fixes the vulnerability\n3. A brief explanation of the attack vector and why your fix resolves it\n\nRespond in JSON format as an array of objects with fields: id, confidence, fixed_code, explanation\nKeep fixed_code as the actual replacement code (not a description). Only output valid JSON, no markdown."
+                    "content": "You are AetherVerify, an expert security code analyst with deep knowledge of OWASP Top 10, CWE, and real-world exploit patterns.\n\nFor each vulnerability candidate, you MUST:\n1. Determine if it is a TRUE POSITIVE (real, exploitable vulnerability) or FALSE POSITIVE (safe code incorrectly flagged). Set is_false_positive accordingly.\n2. If true positive: provide a confidence score (0.4-1.0), write the ACTUAL corrected code as a drop-in replacement (not comments or descriptions), and explain the attack vector.\n3. If false positive: set is_false_positive to true, confidence to 0.0, and explain why it is safe.\n\nCommon false positives to watch for:\n- ChromaDB/vector DB operations flagged as SQL injection (ChromaDB uses no SQL)\n- ORM method calls like .objects.get(), .query.filter() flagged as SQL injection\n- Method calls like store.delete_conversation() flagged as raw SQL\n- pickle.load() on internal metadata files (lower severity, not user-input driven)\n- hashlib.md5/sha1 used for checksums (not password hashing)\n\nRespond as a JSON array: [{\"id\": \"VULN-XXXX\", \"is_false_positive\": false, \"confidence\": 0.85, \"fixed_code\": \"actual_replacement_code_here\", \"explanation\": \"...\"}]\nOnly output valid JSON, no markdown fences."
                 },
                 {
                     "role": "user",
                     "content": prompt
                 }
             ],
-            "temperature": 0.2,
+            "temperature": 0.15,
             "max_tokens": 4096
         });
 
@@ -415,14 +415,26 @@ async fn enrich_with_llm(
             if let Ok(enrichments) = serde_json::from_str::<Vec<LlmEnrichment>>(json_content) {
                 for enrichment in enrichments {
                     if let Some(vuln) = vulns.iter_mut().find(|v| v.id == enrichment.id) {
-                        if enrichment.confidence > 0.0 {
-                            vuln.confidence = enrichment.confidence;
-                        }
-                        if !enrichment.fixed_code.is_empty() {
-                            vuln.fixed_code = enrichment.fixed_code;
-                        }
-                        if !enrichment.explanation.is_empty() {
-                            vuln.ai_explanation = Some(enrichment.explanation);
+                        // If LLM says false positive, mark for removal
+                        if enrichment.is_false_positive.unwrap_or(false)
+                            || enrichment.confidence < 0.1
+                        {
+                            vuln.confidence = 0.0; // Will be filtered out below
+                            vuln.ai_explanation =
+                                Some(format!("FALSE POSITIVE: {}", enrichment.explanation));
+                        } else {
+                            if enrichment.confidence > 0.0 {
+                                vuln.confidence = enrichment.confidence;
+                            }
+                            if !enrichment.fixed_code.is_empty()
+                                && !enrichment.fixed_code.starts_with("#")
+                                && !enrichment.fixed_code.starts_with("//")
+                            {
+                                vuln.fixed_code = enrichment.fixed_code;
+                            }
+                            if !enrichment.explanation.is_empty() {
+                                vuln.ai_explanation = Some(enrichment.explanation);
+                            }
                         }
                         vuln.detection_layer = format!("{} + L4-LLM", vuln.detection_layer);
                     }
@@ -431,12 +443,17 @@ async fn enrich_with_llm(
         }
     }
 
+    // ── Filter out false positives identified by LLM ──
+    vulns.retain(|v| v.confidence >= 0.25);
+
     Ok(())
 }
 
 #[derive(Debug, Deserialize)]
 struct LlmEnrichment {
     id: String,
+    #[serde(default)]
+    is_false_positive: Option<bool>,
     confidence: f32,
     fixed_code: String,
     explanation: String,
@@ -444,13 +461,13 @@ struct LlmEnrichment {
 
 fn build_security_prompt(workspace_root: &str, vulns: &[&SecurityVulnerability]) -> String {
     let mut prompt = format!(
-        "Analyze these security vulnerabilities found in the project at `{}`.\n\nFor each vulnerability, assess the real-world exploitability, provide an accurate confidence score, write the actual fixed code, and explain the attack vector.\n\n",
+        "Analyze these security vulnerability CANDIDATES found in the project at `{}`.\n\nCRITICAL: Many of these may be FALSE POSITIVES from regex-based pattern matching. You MUST carefully analyze each one and determine if it is a real vulnerability or a false alarm. For true positives, provide the actual fixed code as a drop-in replacement.\n\n",
         workspace_root
     );
 
     for vuln in vulns {
         prompt.push_str(&format!(
-            "--- Vulnerability {} ---\nType: {} ({})\nFile: {}:{}\nSeverity: {}\nDescription: {}\nVulnerable Code:\n```\n{}\n```\nPattern-suggested fix:\n```\n{}\n```\n\n",
+            "--- Candidate {} ---\nType: {} ({})\nFile: {}:{}\nSeverity: {}\nDescription: {}\nCode Context (surrounding lines):\n```\n{}\n```\nInitial fix suggestion:\n```\n{}\n```\n\n",
             vuln.id,
             vuln.vuln_type,
             vuln.owasp_category,
@@ -463,6 +480,6 @@ fn build_security_prompt(workspace_root: &str, vulns: &[&SecurityVulnerability])
         ));
     }
 
-    prompt.push_str("Respond with a JSON array of objects: [{\"id\": \"VULN-XXXX\", \"confidence\": 0.85, \"fixed_code\": \"...\", \"explanation\": \"...\"}]\nOnly output valid JSON.");
+    prompt.push_str("Respond with a JSON array: [{\"id\": \"VULN-XXXX\", \"is_false_positive\": true/false, \"confidence\": 0.85, \"fixed_code\": \"actual_code\", \"explanation\": \"why\"}]\nOnly valid JSON.");
     prompt
 }

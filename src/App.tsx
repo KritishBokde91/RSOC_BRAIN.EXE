@@ -118,6 +118,7 @@ function App() {
   const [currentFile, setCurrentFile] = useState("");
   const [scannedCount, setScannedCount] = useState(0);
   const [stageMessage, setStageMessage] = useState("");
+  const [streamingLogs, setStreamingLogs] = useState<string[]>([]);
 
   // Fix tracking
   const [fixedIds, setFixedIds] = useState<Set<string>>(new Set());
@@ -169,22 +170,43 @@ function App() {
     unlistenRefs.current = [];
 
     const u1 = await listen<ScanStagePayload>("scan-stage", (event) => {
-      const { stage, message } = event.payload;
+      const { stage, message, durationMs } = event.payload;
       setStageMessage(message);
-      if (stage === "scanning") setScanStage("scanning");
-      else if (stage === "analyzing") setScanStage("analyzing");
-      else if (stage === "complete") setScanStage("complete");
-      else if (stage === "llm-skipped") setScanStage("complete");
+      const ts = new Date().toLocaleTimeString('en-US', { hour12: false });
+      if (stage === "scanning") {
+        setScanStage("scanning");
+        setStreamingLogs(prev => [...prev, `[${ts}] \u2500 STAGE: Scanning files for vulnerabilities...`]);
+      } else if (stage === "scan-complete") {
+        setStreamingLogs(prev => [...prev, `[${ts}] \u2714 SCAN COMPLETE: ${message} (${durationMs}ms)`]);
+      } else if (stage === "analyzing") {
+        setScanStage("analyzing");
+        setStreamingLogs(prev => [...prev, `[${ts}] \u2500 STAGE: Running AI analysis pipeline...`]);
+      } else if (stage === "llm-complete") {
+        setStreamingLogs(prev => [...prev, `[${ts}] \u2714 LLM ANALYSIS: ${message} (${durationMs}ms)`]);
+      } else if (stage === "llm-skipped") {
+        setScanStage("complete");
+        setStreamingLogs(prev => [...prev, `[${ts}] \u26A0 LLM SKIPPED: ${message}`]);
+      } else if (stage === "complete") {
+        setScanStage("complete");
+        setStreamingLogs(prev => [...prev, `[${ts}] \u2714 COMPLETE: ${message} (${durationMs}ms)`]);
+      }
     });
 
     const u2 = await listen<ScanProgressPayload>("scan-progress", (event) => {
       const { currentFile: file, scannedSoFar } = event.payload;
       setCurrentFile(file);
       setScannedCount(scannedSoFar);
+      if (scannedSoFar % 5 === 0 || scannedSoFar <= 3) {
+        const ts = new Date().toLocaleTimeString('en-US', { hour12: false });
+        setStreamingLogs(prev => [...prev, `[${ts}]   SCAN ${String(scannedSoFar).padStart(4)} \u2502 ${file}`]);
+      }
     });
 
     const u3 = await listen<SecurityVulnerability>("scan-vuln-found", (event) => {
       setStreamingVulns((prev) => [...prev, event.payload]);
+      const v = event.payload;
+      const ts = new Date().toLocaleTimeString('en-US', { hour12: false });
+      setStreamingLogs(prev => [...prev, `[${ts}] \u26A0 FOUND [${v.severity}] ${v.vulnType} in ${v.file}:${v.line} (${Math.round(v.confidence * 100)}%)`]);
     });
 
     unlistenRefs.current = [u1, u2, u3];
@@ -203,6 +225,7 @@ function App() {
     setCurrentFile("");
     setScannedCount(0);
     setStageMessage("Initializing scan…");
+    setStreamingLogs([`[${new Date().toLocaleTimeString('en-US', { hour12: false })}] \u2500 Initializing AetherVerify scanner...`]);
     setSeverityFilter("All");
     setSearchQuery("");
 
@@ -424,6 +447,23 @@ function App() {
             <div className="live-progress-bar">
               <div className="live-progress-fill live-progress-animated" />
             </div>
+            {/* Terminal-style log panel */}
+            <div className="terminal-panel">
+              <div className="terminal-header">
+                <span className="terminal-dot terminal-dot-red" />
+                <span className="terminal-dot terminal-dot-yellow" />
+                <span className="terminal-dot terminal-dot-green" />
+                <span className="terminal-title">AetherVerify Scanner Terminal</span>
+              </div>
+              <div className="terminal-body">
+                {streamingLogs.slice(-50).map((log, i) => (
+                  <div key={i} className={`terminal-line ${log.includes('FOUND') ? 'terminal-warn' : log.includes('\u2714') ? 'terminal-success' : ''}`}>
+                    {log}
+                  </div>
+                ))}
+                {isScanning && <div className="terminal-line terminal-cursor">_</div>}
+              </div>
+            </div>
           </div>
         )}
 
@@ -510,7 +550,7 @@ function App() {
               </div>
             )}
 
-            {/* Pipeline log */}
+            {/* Pipeline log + terminal */}
             {scanResult && scanResult.pipelineLog.length > 0 && (
               <div className="pipeline-log">
                 {scanResult.pipelineLog.map((step, i) => (
@@ -521,6 +561,28 @@ function App() {
                   </div>
                 ))}
               </div>
+            )}
+
+            {/* Post-scan terminal log (collapsed) */}
+            {scanResult && streamingLogs.length > 0 && (
+              <details className="terminal-details">
+                <summary className="terminal-summary">📟 Scanner Terminal Log ({streamingLogs.length} events)</summary>
+                <div className="terminal-panel">
+                  <div className="terminal-header">
+                    <span className="terminal-dot terminal-dot-red" />
+                    <span className="terminal-dot terminal-dot-yellow" />
+                    <span className="terminal-dot terminal-dot-green" />
+                    <span className="terminal-title">Scan Log</span>
+                  </div>
+                  <div className="terminal-body">
+                    {streamingLogs.map((log, i) => (
+                      <div key={i} className={`terminal-line ${log.includes('FOUND') ? 'terminal-warn' : log.includes('\u2714') ? 'terminal-success' : ''}`}>
+                        {log}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              </details>
             )}
 
             {/* No vulns */}

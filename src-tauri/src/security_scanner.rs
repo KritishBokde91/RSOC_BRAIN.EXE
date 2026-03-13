@@ -181,27 +181,47 @@ fn run_all_security_detectors(
     let mut vulns = Vec::new();
     let lines: Vec<&str> = source.lines().collect();
 
-    // Injection attacks
-    vulns.extend(detect_sql_injection(file, lang, &lines, counter));
-    vulns.extend(detect_xss(file, lang, &lines, counter));
-    vulns.extend(detect_command_injection(file, lang, &lines, counter));
-    vulns.extend(detect_header_injection(file, lang, &lines, counter));
+    // ── Context-aware analysis: determine what this file actually does ──
+    let caps = analyze_file_capabilities(lang, source);
 
-    // Broken access
-    vulns.extend(detect_auth_weaknesses(file, lang, &lines, counter));
-    vulns.extend(detect_csrf_missing(file, lang, &lines, counter));
-    vulns.extend(detect_open_redirect(file, lang, &lines, counter));
+    // Injection attacks — only if relevant imports exist
+    if caps.has_sql {
+        vulns.extend(detect_sql_injection(file, lang, &lines, counter));
+    }
+    if caps.has_web_framework {
+        vulns.extend(detect_xss(file, lang, &lines, counter));
+        vulns.extend(detect_header_injection(file, lang, &lines, counter));
+        vulns.extend(detect_csrf_missing(file, lang, &lines, counter));
+        vulns.extend(detect_open_redirect(file, lang, &lines, counter));
+    }
+    // Command injection — always check for eval/exec, but os.system only with imports
+    vulns.extend(detect_command_injection(file, lang, &lines, counter, &caps));
 
-    // Data exposure
+    // Broken access — only with web frameworks
+    if caps.has_web_framework {
+        vulns.extend(detect_auth_weaknesses(file, lang, &lines, counter));
+    }
+
+    // Data exposure — always check but with context
     vulns.extend(detect_hardcoded_secrets(file, lang, &lines, counter));
     vulns.extend(detect_info_leakage(file, lang, &lines, counter));
-    vulns.extend(detect_weak_crypto(file, lang, &lines, counter));
+    if caps.has_crypto {
+        vulns.extend(detect_weak_crypto(file, lang, &lines, counter));
+    }
 
-    // Insecure design
-    vulns.extend(detect_path_traversal(file, lang, &lines, counter));
-    vulns.extend(detect_ssrf(file, lang, &lines, counter));
-    vulns.extend(detect_insecure_deserialization(file, lang, &lines, counter));
-    vulns.extend(detect_unsafe_file_ops(file, lang, &lines, counter));
+    // Insecure design — gate behind relevant imports
+    if caps.has_file_io || caps.has_web_framework {
+        vulns.extend(detect_path_traversal(file, lang, &lines, counter));
+    }
+    if caps.has_http_client {
+        vulns.extend(detect_ssrf(file, lang, &lines, counter));
+    }
+    if caps.has_deserialization {
+        vulns.extend(detect_insecure_deserialization(file, lang, &lines, counter));
+    }
+    if caps.has_file_io {
+        vulns.extend(detect_unsafe_file_ops(file, lang, &lines, counter));
+    }
     vulns.extend(detect_error_handling(file, lang, &lines, counter));
     vulns.extend(detect_insecure_randomness(file, lang, &lines, counter));
 
@@ -221,7 +241,215 @@ fn get_line_context(lines: &[&str], line_idx: usize, window: usize) -> (String, 
 }
 
 // ════════════════════════════════════════════════════════════════════
-// DETECTOR 1: SQL Injection
+// CONTEXT-AWARE IMPORT ANALYSIS
+// ════════════════════════════════════════════════════════════════════
+
+/// Capabilities detected from file imports — determines which detectors apply.
+#[derive(Debug, Default)]
+struct FileCapabilities {
+    has_sql: bool,
+    has_web_framework: bool,
+    has_deserialization: bool,
+    has_crypto: bool,
+    has_http_client: bool,
+    has_shell_exec: bool,
+    has_file_io: bool,
+}
+
+/// Analyze imports/use statements to determine what this file actually does.
+fn analyze_file_capabilities(lang: &str, source: &str) -> FileCapabilities {
+    let mut caps = FileCapabilities::default();
+    let lower = source.to_lowercase();
+
+    match lang {
+        "python" => {
+            // SQL-related imports
+            caps.has_sql = lower.contains("import sqlite3")
+                || lower.contains("import psycopg")
+                || lower.contains("import mysql")
+                || lower.contains("import pymysql")
+                || lower.contains("from sqlalchemy")
+                || lower.contains("import sqlalchemy")
+                || lower.contains("from django.db")
+                || lower.contains("import peewee")
+                || lower.contains(".execute(")
+                    && (lower.contains("cursor") || lower.contains("connection"))
+                || lower.contains("raw(")
+                    && (lower.contains("select ")
+                        || lower.contains("insert ")
+                        || lower.contains("update ")
+                        || lower.contains("delete "));
+
+            // Web framework imports
+            caps.has_web_framework = lower.contains("from flask")
+                || lower.contains("import flask")
+                || lower.contains("from django")
+                || lower.contains("import django")
+                || lower.contains("from fastapi")
+                || lower.contains("import fastapi")
+                || lower.contains("from starlette")
+                || lower.contains("from sanic")
+                || lower.contains("from tornado")
+                || lower.contains("from bottle");
+
+            // Deserialization
+            caps.has_deserialization = lower.contains("import pickle")
+                || lower.contains("import yaml")
+                || lower.contains("import marshal")
+                || lower.contains("import shelve")
+                || lower.contains("from pickle")
+                || lower.contains("from yaml");
+
+            // Crypto
+            caps.has_crypto = lower.contains("import hashlib")
+                || lower.contains("from cryptography")
+                || lower.contains("import hmac")
+                || lower.contains("import random");
+
+            // HTTP client
+            caps.has_http_client = lower.contains("import requests")
+                || lower.contains("import urllib")
+                || lower.contains("import httpx")
+                || lower.contains("import aiohttp");
+
+            // Shell execution
+            caps.has_shell_exec = lower.contains("import subprocess")
+                || lower.contains("import os")
+                || lower.contains("from os")
+                || lower.contains("import shlex");
+
+            // File I/O
+            caps.has_file_io = lower.contains("import os")
+                || lower.contains("from os")
+                || lower.contains("import pathlib")
+                || lower.contains("import tempfile")
+                || lower.contains("import shutil");
+        }
+        "javascript" | "typescript" => {
+            caps.has_sql = lower.contains("require('mysql")
+                || lower.contains("require('pg")
+                || lower.contains("require('sqlite")
+                || lower.contains("require('better-sqlite")
+                || lower.contains("from 'mysql")
+                || lower.contains("from 'pg")
+                || lower.contains("from 'sqlite")
+                || lower.contains("from 'sequelize")
+                || lower.contains("from 'knex")
+                || lower.contains("from 'typeorm")
+                || lower.contains("from 'prisma");
+
+            caps.has_web_framework = lower.contains("require('express")
+                || lower.contains("from 'express")
+                || lower.contains("require('koa")
+                || lower.contains("from 'koa")
+                || lower.contains("require('fastify")
+                || lower.contains("from 'fastify")
+                || lower.contains("from 'next");
+
+            caps.has_deserialization = lower.contains("serialize") || lower.contains("unserialize");
+
+            caps.has_http_client = lower.contains("require('axios")
+                || lower.contains("from 'axios")
+                || lower.contains("require('got")
+                || lower.contains("require('node-fetch")
+                || lower.contains("from 'node-fetch");
+
+            caps.has_shell_exec =
+                lower.contains("child_process") || lower.contains("require('shelljs");
+
+            caps.has_crypto = lower.contains("require('crypto")
+                || lower.contains("from 'crypto")
+                || lower.contains("math.random");
+
+            caps.has_file_io = lower.contains("require('fs")
+                || lower.contains("from 'fs")
+                || lower.contains("require('path")
+                || lower.contains("from 'path");
+        }
+        "rust" => {
+            caps.has_sql =
+                lower.contains("sqlx") || lower.contains("diesel") || lower.contains("rusqlite");
+            caps.has_shell_exec =
+                lower.contains("std::process::command") || lower.contains("command::new");
+            caps.has_crypto = lower.contains("md5") || lower.contains("sha1");
+            caps.has_http_client = lower.contains("reqwest") || lower.contains("hyper");
+            caps.has_web_framework = lower.contains("actix")
+                || lower.contains("rocket")
+                || lower.contains("axum")
+                || lower.contains("warp");
+            caps.has_deserialization = lower.contains("serde") || lower.contains("bincode");
+            caps.has_file_io = lower.contains("std::fs");
+        }
+        _ => {
+            // For unknown languages, assume everything is possible
+            caps.has_sql = true;
+            caps.has_web_framework = true;
+            caps.has_deserialization = true;
+            caps.has_crypto = true;
+            caps.has_http_client = true;
+            caps.has_shell_exec = true;
+            caps.has_file_io = true;
+        }
+    }
+
+    caps
+}
+
+/// Check if a line is part of a known safe API (false positive suppression).
+fn is_safe_api_call(line: &str, lang: &str) -> bool {
+    let lower = line.to_lowercase();
+    match lang {
+        "python" => {
+            // ChromaDB, vector DB, ORM safe operations
+            lower.contains(".collection.get(")
+                || lower.contains(".collection.query(")
+                || lower.contains(".collection.add(")
+                || lower.contains(".collection.update(")
+                || lower.contains(".collection.delete(")
+                || lower.contains(".collection.peek(")
+                || lower.contains(".collection.count(")
+                // Store/pipeline method calls (not raw SQL)
+                || (lower.contains(".store.") && !lower.contains("execute"))
+                || (lower.contains(".delete_conversation(") && !lower.contains("execute"))
+                || (lower.contains(".get_conversation(") && !lower.contains("execute"))
+                // ORM safe query methods
+                || lower.contains(".objects.filter(")
+                || lower.contains(".objects.get(")
+                || lower.contains(".objects.create(")
+                || lower.contains(".objects.all(")
+                || lower.contains(".query.filter(")
+                || lower.contains(".query.get(")
+                // Redis, MongoDB, etc.
+                || lower.contains(".find_one(")
+                || lower.contains(".find(")
+                || lower.contains(".insert_one(")
+                || lower.contains(".insert_many(")
+                || lower.contains(".update_one(")
+                || lower.contains(".aggregate(")
+                || lower.contains(".hget(")
+                || lower.contains(".hset(")
+        }
+        "javascript" | "typescript" => {
+            lower.contains(".findone(")
+                || lower.contains(".findmany(")
+                || lower.contains(".findunique(")
+                || lower.contains(".create(")
+                || lower.contains(".upsert(")
+                || lower.contains("prisma.")
+                || lower.contains("mongoose.")
+        }
+        _ => false,
+    }
+}
+
+/// Check if a line contains actual SQL keywords in string literals.
+fn contains_sql_in_string(line: &str) -> bool {
+    let re = Regex::new(r#"(?i)["'`].*\b(SELECT|INSERT\s+INTO|UPDATE\s+\w+\s+SET|DELETE\s+FROM|DROP\s+TABLE|ALTER\s+TABLE|CREATE\s+TABLE)\b.*["'`]"#).unwrap();
+    re.is_match(line)
+}
+
+// ════════════════════════════════════════════════════════════════════
+// DETECTOR 1: SQL Injection (Context-Aware)
 // ════════════════════════════════════════════════════════════════════
 
 fn detect_sql_injection(
@@ -281,9 +509,17 @@ fn detect_sql_injection(
         if trimmed.starts_with("//") || trimmed.starts_with('#') || trimmed.starts_with("/*") {
             continue;
         }
+        // Skip known safe API calls (ChromaDB, ORMs, NoSQL, etc.)
+        if is_safe_api_call(trimmed, lang) {
+            continue;
+        }
         for (pattern, desc) in &patterns {
             if let Ok(re) = Regex::new(pattern) {
                 if re.is_match(trimmed) {
+                    // For Python raw() pattern, verify actual SQL keywords are present
+                    if pattern.contains("raw") && !contains_sql_in_string(trimmed) {
+                        continue;
+                    }
                     let (ctx, _start, end) = get_line_context(lines, i, 2);
                     let fixed = generate_sql_fix(trimmed, lang);
                     vulns.push(SecurityVulnerability {
@@ -406,11 +642,12 @@ fn detect_command_injection(
     lang: &str,
     lines: &[&str],
     counter: &mut u64,
+    caps: &FileCapabilities,
 ) -> Vec<SecurityVulnerability> {
     let mut vulns = Vec::new();
 
     let patterns: Vec<(&str, &str, &str)> = match lang {
-        "python" => vec![
+        "python" if caps.has_shell_exec => vec![
             (r"os\.system\s*\(", "os.system() executes shell commands — command injection risk",
              "# Use subprocess with argument list (no shell):\n# import subprocess\n# subprocess.run(['command', 'arg1'], check=True)"),
             (r"subprocess\.\w+\(.*shell\s*=\s*True", "subprocess with shell=True allows injection via shell metacharacters",
@@ -424,9 +661,23 @@ fn detect_command_injection(
             (r"__import__\s*\(", "__import__() with user input allows arbitrary module loading",
              "# Use explicit imports instead of dynamic __import__()"),
         ],
-        "javascript" | "typescript" => vec![
+        "python" => vec![
+            // Only eval/exec — always dangerous regardless of imports
+            (r"eval\s*\(", "eval() executes arbitrary Python code — critical injection risk",
+             "# Use ast.literal_eval() for safe evaluation of literals:\n# import ast\n# result = ast.literal_eval(user_input)"),
+            (r"exec\s*\(", "exec() executes arbitrary Python code — critical injection risk",
+             "# Remove exec() and implement the logic directly, or use a safe sandbox"),
+        ],
+        "javascript" | "typescript" if caps.has_shell_exec => vec![
             (r"child_process\.\w*exec\b", "child_process.exec() runs shell commands — injection risk",
              "// Use execFile() with argument array:\n// const { execFile } = require('child_process');\n// execFile('cmd', [arg1, arg2], callback);"),
+            (r"eval\s*\(", "eval() executes arbitrary code — critical injection/XSS risk",
+             "// Use JSON.parse() for JSON, or a safe expression parser"),
+            (r"new\s+Function\s*\(", "new Function() creates functions from strings — code injection risk",
+             "// Define functions directly instead of from string templates"),
+        ],
+        "javascript" | "typescript" => vec![
+            // Only eval — always dangerous regardless of imports
             (r"eval\s*\(", "eval() executes arbitrary code — critical injection/XSS risk",
              "// Use JSON.parse() for JSON, or a safe expression parser"),
             (r"new\s+Function\s*\(", "new Function() creates functions from strings — code injection risk",
@@ -1439,7 +1690,11 @@ mod tests {
     fn detects_eval_as_command_injection() {
         let lines = vec!["result = eval(user_input)"];
         let mut counter = 0;
-        let vulns = detect_command_injection("test.py", "python", &lines, &mut counter);
+        let caps = FileCapabilities {
+            has_shell_exec: true,
+            ..Default::default()
+        };
+        let vulns = detect_command_injection("test.py", "python", &lines, &mut counter, &caps);
         assert!(!vulns.is_empty());
         assert_eq!(vulns[0].vuln_type, "CommandInjection");
     }
