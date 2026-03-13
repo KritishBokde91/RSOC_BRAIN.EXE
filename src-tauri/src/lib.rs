@@ -1,3 +1,4 @@
+mod audit;
 mod docker;
 mod ingestion;
 mod intelligence;
@@ -13,6 +14,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use audit::{run_repository_audit, RepositoryAuditRequest, RepositoryAuditResult};
 use docker::{
     cancel_sandbox_run, run_sandbox_command, AppContext, SandboxRequest, SandboxRunHandle,
 };
@@ -108,6 +110,14 @@ async fn apply_vulnerability_fix(request: FixRequest) -> Result<FixResult, Strin
     pipeline::apply_fix(request).await
 }
 
+#[tauri::command]
+async fn run_ai_repository_audit(
+    app: tauri::AppHandle,
+    request: RepositoryAuditRequest,
+) -> Result<RepositoryAuditResult, String> {
+    run_repository_audit(app, request).await
+}
+
 fn default_workspace_root() -> Result<PathBuf, String> {
     // 1. Check env var first
     if let Ok(env_root) = std::env::var("AETHERVERIFY_WORKSPACE_ROOT") {
@@ -149,7 +159,8 @@ pub fn run() {
             apply_patch_to_workspace,
             detect_static_bugs,
             full_security_scan,
-            apply_vulnerability_fix
+            apply_vulnerability_fix,
+            run_ai_repository_audit
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

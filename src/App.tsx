@@ -1,10 +1,8 @@
-import { useState, useCallback, useRef, useEffect } from "react";
+import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import "./App.css";
-
-/* ── Tauri response types ─────────────────────────────────────────── */
 
 interface AppContext {
   workspaceRoot: string;
@@ -20,690 +18,662 @@ interface AppContext {
   llmApiKeyConfigured: boolean;
 }
 
-interface SecurityVulnerability {
-  id: string;
-  file: string;
-  line: number;
-  endLine: number;
-  severity: string;
-  owaspCategory: string;
-  vulnType: string;
-  title: string;
-  description: string;
-  originalCode: string;
-  fixedCode: string;
-  confidence: number;
-  aiExplanation: string | null;
-  detectionLayer: string;
-}
-
-interface PipelineStep {
+interface AuditStagePayload {
   stage: string;
   message: string;
   durationMs: number;
 }
 
-interface FullScanResult {
+interface SandboxStatusPayload {
+  runId: string;
+  stage: string;
+  message: string;
+  exitCode: number | null;
+}
+
+interface SandboxOutputPayload {
+  runId: string;
+  stream: "stdout" | "stderr";
+  chunk: string;
+}
+
+interface AuditCommandResult {
+  label: string;
+  command: string;
+  exitCode: number;
+  status: string;
+  durationMs: number;
+  outputPreview: string;
+}
+
+interface AuditFinding {
+  id: string;
+  title: string;
+  severity: "Critical" | "High" | "Medium" | "Low";
+  category: string;
+  confidence: number;
+  file: string | null;
+  line: number | null;
+  source: string;
+  evidence: string;
+  explanation: string;
+  suggestion: string;
+  fixSnippet: string | null;
+}
+
+interface RepositoryAuditResult {
   workspaceRoot: string;
-  scannedFiles: number;
-  totalVulnerabilities: number;
-  criticalCount: number;
-  highCount: number;
-  mediumCount: number;
-  lowCount: number;
-  vulnerabilities: SecurityVulnerability[];
-  pipelineLog: PipelineStep[];
+  sourceKind: string;
+  repositoryUrl: string | null;
+  detectedProjectType: string;
+  primaryLanguage: string;
+  recommendedContainerImage: string;
+  selectedContainerImage: string;
+  reasoning: string;
+  installCommand: string | null;
+  buildCommand: string | null;
+  testCommand: string | null;
+  runCommand: string | null;
+  runTimeoutSeconds: number;
+  executedCommands: AuditCommandResult[];
+  findings: AuditFinding[];
+  summary: string;
   warnings: string[];
 }
 
-interface FixResult {
-  success: boolean;
-  message: string;
+type AuditState = "idle" | "running" | "complete" | "error";
+
+interface TerminalLine {
+  id: string;
+  tone: "stage" | "info" | "output" | "error" | "success";
+  text: string;
 }
 
-/* ── Streaming event payloads ─────────────────────────────────────── */
-
-interface ScanStagePayload {
-  stage: string;
-  message: string;
-  durationMs: number;
-}
-
-interface ScanProgressPayload {
-  currentFile: string;
-  scannedSoFar: number;
-  vulnsFoundSoFar: number;
-}
-
-/* ── Helpers ───────────────────────────────────────────────────── */
-
-const severityColor: Record<string, string> = {
-  Critical: "#ff4757",
-  High: "#ffa502",
-  Medium: "#f7c35f",
-  Low: "#72a0ff",
+const severityOrder: Record<AuditFinding["severity"], number> = {
+  Critical: 0,
+  High: 1,
+  Medium: 2,
+  Low: 3,
 };
 
-const severityBorder: Record<string, string> = {
-  Critical: "rgba(255, 71, 87, 0.6)",
-  High: "rgba(255, 165, 2, 0.5)",
-  Medium: "rgba(247, 195, 95, 0.4)",
-  Low: "rgba(114, 160, 255, 0.3)",
+const severityAccent: Record<AuditFinding["severity"], string> = {
+  Critical: "#ff6b6b",
+  High: "#ffb454",
+  Medium: "#ffd166",
+  Low: "#7bdff2",
 };
 
-type ScanStage =
-  | "idle"
-  | "scanning"
-  | "analyzing"
-  | "complete"
-  | "error";
+function nowStamp() {
+  return new Date().toLocaleTimeString("en-US", { hour12: false });
+}
 
-type SeverityFilter = "All" | "Critical" | "High" | "Medium" | "Low";
+function makeTerminalLine(
+  tone: TerminalLine["tone"],
+  text: string,
+): TerminalLine {
+  return {
+    id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+    tone,
+    text,
+  };
+}
 
-/* ── App ──────────────────────────────────────────────────────────── */
+function appendCapped(lines: TerminalLine[], next: TerminalLine[]) {
+  const merged = [...lines, ...next];
+  return merged.slice(-450);
+}
+
+function shortRunId(runId: string) {
+  return runId.slice(0, 8);
+}
 
 function App() {
-  // Context
   const [appContext, setAppContext] = useState<AppContext | null>(null);
   const [contextError, setContextError] = useState("");
-  const [selectedWorkspace, setSelectedWorkspace] = useState<string>("");
 
-  // Scan state
-  const [scanStage, setScanStage] = useState<ScanStage>("idle");
-  const [scanResult, setScanResult] = useState<FullScanResult | null>(null);
-  const [scanError, setScanError] = useState("");
+  const [workspaceRoot, setWorkspaceRoot] = useState("");
+  const [repositoryUrl, setRepositoryUrl] = useState("");
+  const [containerImage, setContainerImage] = useState("");
+  const [issuePrompt, setIssuePrompt] = useState(
+    "Focus on likely runtime failures, logical bugs, and risky implementation issues.",
+  );
 
-  // Streaming state
-  const [streamingVulns, setStreamingVulns] = useState<SecurityVulnerability[]>([]);
-  const [currentFile, setCurrentFile] = useState("");
-  const [scannedCount, setScannedCount] = useState(0);
-  const [stageMessage, setStageMessage] = useState("");
-  const [streamingLogs, setStreamingLogs] = useState<string[]>([]);
+  const [auditState, setAuditState] = useState<AuditState>("idle");
+  const [stageLabel, setStageLabel] = useState("Ready to inspect a repository.");
+  const [auditError, setAuditError] = useState("");
+  const [auditResult, setAuditResult] = useState<RepositoryAuditResult | null>(null);
+  const [terminalLines, setTerminalLines] = useState<TerminalLine[]>([
+    makeTerminalLine(
+      "info",
+      `[${nowStamp()}] Terminal ready. Start an audit to stream clone, setup, run, and analysis output here.`,
+    ),
+  ]);
 
-  // Fix tracking
-  const [fixedIds, setFixedIds] = useState<Set<string>>(new Set());
-  const [skippedIds, setSkippedIds] = useState<Set<string>>(new Set());
-  const [fixingId, setFixingId] = useState<string | null>(null);
+  const terminalBodyRef = useRef<HTMLDivElement>(null);
+  const unlistenRef = useRef<UnlistenFn[]>([]);
 
-  // Expanded vulnerability
-  const [expandedId, setExpandedId] = useState<string | null>(null);
-
-  // Filters
-  const [severityFilter, setSeverityFilter] = useState<SeverityFilter>("All");
-  const [searchQuery, setSearchQuery] = useState("");
-
-  const scrollRef = useRef<HTMLDivElement>(null);
-  const unlistenRefs = useRef<UnlistenFn[]>([]);
-
-  /* ── Load context on mount ─────────────────────────────────────── */
   useEffect(() => {
     invoke<AppContext>("load_app_context")
       .then((context) => {
         setAppContext(context);
-        setSelectedWorkspace(context.workspaceRoot);
+        setWorkspaceRoot(context.workspaceRoot);
+        setContainerImage(context.defaultContainerImage);
       })
-      .catch((e) => setContextError(String(e)));
+      .catch((error) => setContextError(String(error)));
   }, []);
 
-  /* ── Change workspace ──────────────────────────────────────────── */
-  const handleBrowseWorkspace = useCallback(async () => {
+  useEffect(() => {
+    let active = true;
+
+    const attachListeners = async () => {
+      const unlistenStage = await listen<AuditStagePayload>("audit-stage", (event) => {
+        if (!active) return;
+        const line = makeTerminalLine(
+          "stage",
+          `[${nowStamp()}] ${event.payload.stage.toUpperCase()}: ${event.payload.message}`,
+        );
+        setStageLabel(event.payload.message);
+        if (event.payload.stage === "complete") {
+          setAuditState("complete");
+        }
+        setTerminalLines((current) => appendCapped(current, [line]));
+      });
+
+      const unlistenStatus = await listen<SandboxStatusPayload>(
+        "sandbox-status",
+        (event) => {
+          if (!active) return;
+          const tone =
+            event.payload.stage === "failed"
+              ? "error"
+              : event.payload.stage === "completed"
+                ? "success"
+                : "info";
+          const exitSuffix =
+            event.payload.exitCode !== null ? ` (exit ${event.payload.exitCode})` : "";
+          const line = makeTerminalLine(
+            tone,
+            `[${nowStamp()}] [${shortRunId(event.payload.runId)}] ${event.payload.stage.toUpperCase()}: ${event.payload.message}${exitSuffix}`,
+          );
+          setTerminalLines((current) => appendCapped(current, [line]));
+        },
+      );
+
+      const unlistenOutput = await listen<SandboxOutputPayload>(
+        "sandbox-output",
+        (event) => {
+          if (!active) return;
+          const chunks = event.payload.chunk
+            .split(/\r?\n/)
+            .map((line) => line.trimEnd())
+            .filter(Boolean)
+            .map((line) =>
+              makeTerminalLine(
+                event.payload.stream === "stderr" ? "error" : "output",
+                `[${nowStamp()}] [${shortRunId(event.payload.runId)}] ${line}`,
+              ),
+            );
+          if (chunks.length > 0) {
+            setTerminalLines((current) => appendCapped(current, chunks));
+          }
+        },
+      );
+
+      unlistenRef.current = [unlistenStage, unlistenStatus, unlistenOutput];
+    };
+
+    attachListeners().catch((error) => {
+      setContextError(String(error));
+    });
+
+    return () => {
+      active = false;
+      for (const unlisten of unlistenRef.current) {
+        unlisten();
+      }
+      unlistenRef.current = [];
+    };
+  }, []);
+
+  useEffect(() => {
+    const node = terminalBodyRef.current;
+    if (!node) return;
+    node.scrollTop = node.scrollHeight;
+  }, [terminalLines]);
+
+  const findings =
+    auditResult?.findings
+      .slice()
+      .sort((left, right) => severityOrder[left.severity] - severityOrder[right.severity]) ?? [];
+
+  const severityCounts = {
+    critical: findings.filter((finding) => finding.severity === "Critical").length,
+    high: findings.filter((finding) => finding.severity === "High").length,
+    medium: findings.filter((finding) => finding.severity === "Medium").length,
+    low: findings.filter((finding) => finding.severity === "Low").length,
+  };
+
+  async function browseWorkspace() {
     try {
       const selected = await open({
         directory: true,
         multiple: false,
-        title: "Select Workspace to Scan",
+        title: "Select Repository Folder",
       });
       if (selected && typeof selected === "string") {
-        setSelectedWorkspace(selected);
+        setWorkspaceRoot(selected);
       }
-    } catch (e) {
-      console.error("Error opening dialog", e);
+    } catch (error) {
+      setAuditError(String(error));
     }
-  }, []);
-
-  /* ── Setup streaming listeners ─────────────────────────────────── */
-  const setupStreamListeners = useCallback(async () => {
-    // Cleanup any existing listeners
-    for (const unlisten of unlistenRefs.current) {
-      unlisten();
-    }
-    unlistenRefs.current = [];
-
-    const u1 = await listen<ScanStagePayload>("scan-stage", (event) => {
-      const { stage, message, durationMs } = event.payload;
-      setStageMessage(message);
-      const ts = new Date().toLocaleTimeString('en-US', { hour12: false });
-      if (stage === "scanning") {
-        setScanStage("scanning");
-        setStreamingLogs(prev => [...prev, `[${ts}] \u2500 STAGE: Scanning files for vulnerabilities...`]);
-      } else if (stage === "scan-complete") {
-        setStreamingLogs(prev => [...prev, `[${ts}] \u2714 SCAN COMPLETE: ${message} (${durationMs}ms)`]);
-      } else if (stage === "analyzing") {
-        setScanStage("analyzing");
-        setStreamingLogs(prev => [...prev, `[${ts}] \u2500 STAGE: Running AI analysis pipeline...`]);
-      } else if (stage === "llm-complete") {
-        setStreamingLogs(prev => [...prev, `[${ts}] \u2714 LLM ANALYSIS: ${message} (${durationMs}ms)`]);
-      } else if (stage === "llm-skipped") {
-        setScanStage("complete");
-        setStreamingLogs(prev => [...prev, `[${ts}] \u26A0 LLM SKIPPED: ${message}`]);
-      } else if (stage === "complete") {
-        setScanStage("complete");
-        setStreamingLogs(prev => [...prev, `[${ts}] \u2714 COMPLETE: ${message} (${durationMs}ms)`]);
-      }
-    });
-
-    const u2 = await listen<ScanProgressPayload>("scan-progress", (event) => {
-      const { currentFile: file, scannedSoFar } = event.payload;
-      setCurrentFile(file);
-      setScannedCount(scannedSoFar);
-      if (scannedSoFar % 5 === 0 || scannedSoFar <= 3) {
-        const ts = new Date().toLocaleTimeString('en-US', { hour12: false });
-        setStreamingLogs(prev => [...prev, `[${ts}]   SCAN ${String(scannedSoFar).padStart(4)} \u2502 ${file}`]);
-      }
-    });
-
-    const u3 = await listen<SecurityVulnerability>("scan-vuln-found", (event) => {
-      setStreamingVulns((prev) => [...prev, event.payload]);
-      const v = event.payload;
-      const ts = new Date().toLocaleTimeString('en-US', { hour12: false });
-      setStreamingLogs(prev => [...prev, `[${ts}] \u26A0 FOUND [${v.severity}] ${v.vulnType} in ${v.file}:${v.line} (${Math.round(v.confidence * 100)}%)`]);
-    });
-
-    unlistenRefs.current = [u1, u2, u3];
-  }, []);
-
-  /* ── Full scan ─────────────────────────────────────────────────── */
-  const startScan = useCallback(async () => {
-    if (!appContext) return;
-    setScanStage("scanning");
-    setScanError("");
-    setScanResult(null);
-    setFixedIds(new Set());
-    setSkippedIds(new Set());
-    setExpandedId(null);
-    setStreamingVulns([]);
-    setCurrentFile("");
-    setScannedCount(0);
-    setStageMessage("Initializing scan…");
-    setStreamingLogs([`[${new Date().toLocaleTimeString('en-US', { hour12: false })}] \u2500 Initializing AetherVerify scanner...`]);
-    setSeverityFilter("All");
-    setSearchQuery("");
-
-    await setupStreamListeners();
-
-    try {
-      const result = await invoke<FullScanResult>("full_security_scan", {
-        request: { workspaceRoot: selectedWorkspace || appContext.workspaceRoot },
-      });
-      setScanResult(result);
-      setScanStage("complete");
-      if (result.vulnerabilities.length > 0) {
-        // Auto-expand first critical, or first vuln
-        const firstCritical = result.vulnerabilities.find((v) => v.severity === "Critical");
-        setExpandedId(firstCritical?.id ?? result.vulnerabilities[0].id);
-      }
-    } catch (e) {
-      setScanError(String(e));
-      setScanStage("error");
-    }
-
-    // Cleanup listeners
-    for (const unlisten of unlistenRefs.current) {
-      unlisten();
-    }
-    unlistenRefs.current = [];
-  }, [appContext, selectedWorkspace, setupStreamListeners]);
-
-  /* ── Apply fix ─────────────────────────────────────────────────── */
-  const applyFix = useCallback(
-    async (vuln: SecurityVulnerability) => {
-      if (!appContext || !scanResult) return;
-      setFixingId(vuln.id);
-      try {
-        const result = await invoke<FixResult>("apply_vulnerability_fix", {
-          request: {
-            workspaceRoot: scanResult.workspaceRoot,
-            vulnerabilityId: vuln.id,
-            fixedCode: vuln.fixedCode,
-            file: vuln.file,
-            line: vuln.line,
-            endLine: vuln.endLine,
-          },
-        });
-        if (result.success) {
-          setFixedIds((prev) => new Set(prev).add(vuln.id));
-        } else {
-          setScanError(`Fix failed: ${result.message}`);
-        }
-      } catch (e) {
-        setScanError(String(e));
-      } finally {
-        setFixingId(null);
-      }
-    },
-    [appContext, scanResult]
-  );
-
-  const skipVuln = useCallback((id: string) => {
-    setSkippedIds((prev) => new Set(prev).add(id));
-  }, []);
-
-  /* ── Computed values ───────────────────────────────────────────── */
-  const displayVulns = scanResult?.vulnerabilities ?? streamingVulns;
-  const filteredVulns = displayVulns.filter((v) => {
-    if (fixedIds.has(v.id) || skippedIds.has(v.id)) return true; // Still show but dimmed
-    if (severityFilter !== "All" && v.severity !== severityFilter) return false;
-    if (searchQuery) {
-      const q = searchQuery.toLowerCase();
-      return (
-        v.file.toLowerCase().includes(q) ||
-        v.vulnType.toLowerCase().includes(q) ||
-        v.title.toLowerCase().includes(q) ||
-        v.description.toLowerCase().includes(q) ||
-        v.owaspCategory.toLowerCase().includes(q)
-      );
-    }
-    return true;
-  });
-  const activeVulns = filteredVulns.filter(
-    (v) => !fixedIds.has(v.id) && !skippedIds.has(v.id)
-  );
-  const fixedCount = fixedIds.size;
-  const skippedCount = skippedIds.size;
-  const isScanning = scanStage === "scanning" || scanStage === "analyzing";
-
-  /* ── Loading ───────────────────────────────────────────────────── */
-  if (!appContext && !contextError) {
-    return (
-      <div className="app-shell">
-        <div className="loading-splash">
-          <div className="loading-spinner" />
-          <p>Initializing AetherVerify…</p>
-        </div>
-      </div>
-    );
   }
 
-  /* ── Render ─────────────────────────────────────────────────────── */
+  async function startAudit() {
+    if (!appContext) return;
+
+    setAuditState("running");
+    setAuditError("");
+    setAuditResult(null);
+    setStageLabel("Preparing repository analysis...");
+    setTerminalLines([
+      makeTerminalLine(
+        "stage",
+        `[${nowStamp()}] SESSION: Starting AI bug detector pipeline.`,
+      ),
+      makeTerminalLine(
+        "info",
+        `[${nowStamp()}] SOURCE: ${
+          repositoryUrl.trim() || workspaceRoot || appContext.workspaceRoot
+        }`,
+      ),
+    ]);
+
+    try {
+      const result = await invoke<RepositoryAuditResult>("run_ai_repository_audit", {
+        request: {
+          workspaceRoot,
+          repositoryUrl,
+          containerImage,
+          issuePrompt,
+        },
+      });
+      setAuditResult(result);
+      setAuditState("complete");
+      setStageLabel("Audit complete.");
+    } catch (error) {
+      setAuditError(String(error));
+      setAuditState("error");
+      setStageLabel("Audit failed.");
+      setTerminalLines((current) =>
+        appendCapped(current, [
+          makeTerminalLine("error", `[${nowStamp()}] ERROR: ${String(error)}`),
+        ]),
+      );
+    }
+  }
+
   return (
-    <div className="app-shell" ref={scrollRef}>
-      {/* ── Hero ─────────────────────────────────────────────────── */}
-      <header className="hero-panel">
-        <div>
-          <p className="eyebrow">Security Scanner</p>
-          <h1>AetherVerify</h1>
-          <p className="hero-copy">
-            Dynamic + static security analysis powered by AI.
-            One-click vulnerability detection, intelligent fix generation,
-            and diff-based code repair.
+    <div className="app-shell">
+      <header className="hero">
+        <div className="hero-copy">
+          <p className="eyebrow">AI / ML Code Analysis</p>
+          <h1>AI Bug Detector</h1>
+          <p className="hero-text">
+            Clone a repository into an isolated environment, let the LLM infer
+            the stack and the safest way to run it, execute dynamic checks in
+            Docker, and turn the terminal evidence into actionable bug and
+            vulnerability suggestions.
           </p>
         </div>
+
         <div className="hero-metrics">
           <div className="metric-card">
-            <strong>🐳 Docker</strong>
-            <p>
-              {appContext?.dockerAvailable
-                ? `✅ ${appContext.dockerMessage}`
-                : `❌ ${appContext?.dockerMessage ?? "Not connected"}`}
-            </p>
+            <span className="metric-label">Docker</span>
+            <strong>{appContext?.dockerAvailable ? "Ready" : "Unavailable"}</strong>
+            <p>{appContext?.dockerMessage ?? "Checking Docker..."}</p>
           </div>
           <div className="metric-card">
-            <strong>🧠 LLM</strong>
-            <p>
+            <span className="metric-label">LLM</span>
+            <strong>
               {appContext?.llmApiKeyConfigured
-                ? `✅ ${appContext.defaultLlmModel || "Configured"}`
-                : "❌ Set GROQ_API_KEY in .env"}
-            </p>
+                ? appContext.defaultLlmModel || "Configured"
+                : "Needs API key"}
+            </strong>
+            <p>{appContext?.defaultLlmBaseUrl ?? "No endpoint configured"}</p>
           </div>
           <div className="metric-card">
-            <strong>🔬 Embeddings</strong>
-            <p>{appContext?.defaultEmbeddingModel || "Not configured"}</p>
+            <span className="metric-label">Process</span>
+            <strong>{"Clone -> Detect -> Run -> Analyze"}</strong>
+            <p>Terminal stays visible during the full pipeline.</p>
           </div>
         </div>
       </header>
 
-      {contextError && <div className="app-error">⚠️ {contextError}</div>}
+      {(contextError || auditError) && (
+        <div className="error-banner">{contextError || auditError}</div>
+      )}
 
-      {/* ── Workspace Selector ────────────────────────────────────── */}
-      <section className="workspace-section">
-        <div className="workspace-row">
-          <label className="workspace-label">📁 Workspace</label>
-          <div className="workspace-input-group">
-            <input
-              type="text"
-              className="workspace-input"
-              value={selectedWorkspace}
-              onChange={(e) => setSelectedWorkspace(e.target.value)}
-              placeholder="Enter workspace path…"
-              disabled={isScanning}
-            />
-            <button
-              className="workspace-browse-btn"
-              onClick={handleBrowseWorkspace}
-              disabled={isScanning}
-            >
-              Browse
-            </button>
-          </div>
-        </div>
-      </section>
-
-      {/* ── Scan Controls ────────────────────────────────────────── */}
-      <section className="scan-section">
-        <div className="scan-header">
-          <div className="scan-title-row">
-            <h2>🛡️ Security Analysis</h2>
-            {scanStage !== "idle" && scanStage !== "error" && (
-              <div className="pipeline-stepper">
-                <span className={`step ${scanStage === "scanning" || scanStage === "analyzing" || scanStage === "complete" ? "step-done" : ""}`}>
-                  ① Scan
-                </span>
-                <span className="step-arrow">→</span>
-                <span className={`step ${scanStage === "analyzing" || scanStage === "complete" ? "step-done" : ""}`}>
-                  ② AI Analysis
-                </span>
-                <span className="step-arrow">→</span>
-                <span className={`step ${scanStage === "complete" ? "step-done" : ""}`}>
-                  ③ Results
-                </span>
+      <div className="surface-grid">
+        <main className="main-column">
+          <section className="panel controls-panel">
+            <div className="panel-heading">
+              <div>
+                <p className="section-tag">Input</p>
+                <h2>Repository Source</h2>
               </div>
-            )}
-          </div>
-
-          <button
-            className="scan-button"
-            onClick={startScan}
-            disabled={isScanning || !appContext || !selectedWorkspace}
-          >
-            {isScanning ? (
-              <>
-                <span className="scan-spinner" />
-                {scanStage === "scanning" ? "Scanning…" : "AI Analyzing…"}
-              </>
-            ) : (
-              "🛡️ Scan & Secure"
-            )}
-          </button>
-        </div>
-
-        {/* ── Live Progress ────────────────────────────────────────── */}
-        {isScanning && (
-          <div className="live-progress">
-            <div className="live-progress-header">
-              <span className="live-pulse" />
-              <span className="live-stage-msg">{stageMessage}</span>
+              <button
+                className="primary-btn"
+                onClick={startAudit}
+                disabled={
+                  auditState === "running" ||
+                  (!repositoryUrl.trim() && !workspaceRoot.trim())
+                }
+              >
+                {auditState === "running" ? "Analyzing..." : "Clone, Run & Analyze"}
+              </button>
             </div>
-            {scanStage === "scanning" && (
-              <div className="live-details">
-                <span className="live-file-count">{scannedCount} files scanned</span>
-                <span className="live-vuln-count">{streamingVulns.length} vulnerabilities found</span>
+
+            <label className="field">
+              <span>Local Workspace</span>
+              <div className="input-row">
+                <input
+                  value={workspaceRoot}
+                  onChange={(event) => setWorkspaceRoot(event.target.value)}
+                  placeholder="/path/to/local/repository"
+                  disabled={auditState === "running"}
+                />
+                <button
+                  className="secondary-btn"
+                  onClick={browseWorkspace}
+                  disabled={auditState === "running"}
+                >
+                  Browse
+                </button>
               </div>
-            )}
-            {currentFile && scanStage === "scanning" && (
-              <div className="live-current-file">
-                <code>{currentFile}</code>
-              </div>
-            )}
-            <div className="live-progress-bar">
-              <div className="live-progress-fill live-progress-animated" />
+              <small>
+                Primary input. The app copies this workspace into an isolated
+                Docker environment and runs the next steps there.
+              </small>
+            </label>
+
+            <label className="field">
+              <span>Repository URL (Optional)</span>
+              <input
+                value={repositoryUrl}
+                onChange={(event) => setRepositoryUrl(event.target.value)}
+                placeholder="https://github.com/org/project.git"
+                disabled={auditState === "running"}
+              />
+              <small>
+                Only use this when the code is not already available locally.
+              </small>
+            </label>
+
+            <label className="field">
+              <span>Container Image Override</span>
+              <input
+                value={containerImage}
+                onChange={(event) => setContainerImage(event.target.value)}
+                placeholder={appContext?.defaultContainerImage ?? "node:22-bookworm"}
+                disabled={auditState === "running"}
+              />
+              <small>
+                Leave this as-is to use the default, or override it when you
+                already know the runtime you want.
+              </small>
+            </label>
+
+            <label className="field">
+              <span>Audit Focus</span>
+              <textarea
+                value={issuePrompt}
+                onChange={(event) => setIssuePrompt(event.target.value)}
+                rows={4}
+                disabled={auditState === "running"}
+              />
+            </label>
+
+            <div className="status-strip">
+              <span className={`state-pill state-${auditState}`}>{auditState}</span>
+              <span>{stageLabel}</span>
             </div>
-            {/* Terminal-style log panel */}
-            <div className="terminal-panel">
-              <div className="terminal-header">
-                <span className="terminal-dot terminal-dot-red" />
-                <span className="terminal-dot terminal-dot-yellow" />
-                <span className="terminal-dot terminal-dot-green" />
-                <span className="terminal-title">AetherVerify Scanner Terminal</span>
-              </div>
-              <div className="terminal-body">
-                {streamingLogs.slice(-50).map((log, i) => (
-                  <div key={i} className={`terminal-line ${log.includes('FOUND') ? 'terminal-warn' : log.includes('\u2714') ? 'terminal-success' : ''}`}>
-                    {log}
-                  </div>
-                ))}
-                {isScanning && <div className="terminal-line terminal-cursor">_</div>}
-              </div>
-            </div>
-          </div>
-        )}
+          </section>
 
-        {scanError && <div className="app-error">⚠️ {scanError}</div>}
-
-        {/* ── Results ──────────────────────────────────────────── */}
-        {(scanResult || (streamingVulns.length > 0 && scanStage === "complete")) && (
-          <>
-            {/* Summary bar */}
-            <div className="results-summary">
-              <div className="summary-grid">
-                <div className="summary-card">
-                  <span>Files Scanned</span>
-                  <strong>{scanResult?.scannedFiles ?? scannedCount}</strong>
-                </div>
-                <div className="summary-card">
-                  <span>Total Found</span>
-                  <strong>{scanResult?.totalVulnerabilities ?? streamingVulns.length}</strong>
-                </div>
-                <div className="summary-card" style={{ borderColor: "rgba(255,71,87,0.3)" }}>
-                  <span>Critical</span>
-                  <strong style={{ color: "#ff4757" }}>{scanResult?.criticalCount ?? streamingVulns.filter(v => v.severity === "Critical").length}</strong>
-                </div>
-                <div className="summary-card" style={{ borderColor: "rgba(255,165,2,0.3)" }}>
-                  <span>High</span>
-                  <strong style={{ color: "#ffa502" }}>{scanResult?.highCount ?? streamingVulns.filter(v => v.severity === "High").length}</strong>
-                </div>
-                <div className="summary-card" style={{ borderColor: "rgba(247,195,95,0.3)" }}>
-                  <span>Medium</span>
-                  <strong style={{ color: "#f7c35f" }}>{scanResult?.mediumCount ?? streamingVulns.filter(v => v.severity === "Medium").length}</strong>
-                </div>
-                <div className="summary-card" style={{ borderColor: "rgba(114,160,255,0.3)" }}>
-                  <span>Low</span>
-                  <strong style={{ color: "#72a0ff" }}>{scanResult?.lowCount ?? streamingVulns.filter(v => v.severity === "Low").length}</strong>
-                </div>
-              </div>
-
-              {fixedCount + skippedCount > 0 && (
-                <div className="fix-progress-bar">
-                  <div className="fix-progress-label">
-                    ✅ {fixedCount} fixed · ⏭️ {skippedCount} skipped · 📋 {activeVulns.length} remaining
-                  </div>
-                  <div className="fix-progress-track">
-                    <div
-                      className="fix-progress-fill fix-progress-fixed"
-                      style={{ width: `${(fixedCount / (scanResult?.totalVulnerabilities ?? displayVulns.length)) * 100}%` }}
-                    />
-                    <div
-                      className="fix-progress-fill fix-progress-skipped"
-                      style={{ width: `${(skippedCount / (scanResult?.totalVulnerabilities ?? displayVulns.length)) * 100}%` }}
-                    />
+          {auditResult && (
+            <>
+              <section className="panel">
+                <div className="panel-heading">
+                  <div>
+                    <p className="section-tag">Detection</p>
+                    <h2>Runtime Strategy</h2>
                   </div>
                 </div>
+
+                <div className="facts-grid">
+                  <div className="fact-card">
+                    <span>Project Type</span>
+                    <strong>{auditResult.detectedProjectType}</strong>
+                  </div>
+                  <div className="fact-card">
+                    <span>Primary Language</span>
+                    <strong>{auditResult.primaryLanguage}</strong>
+                  </div>
+                  <div className="fact-card">
+                    <span>Source</span>
+                    <strong>{auditResult.sourceKind}</strong>
+                  </div>
+                  <div className="fact-card">
+                    <span>Container</span>
+                    <strong>{auditResult.selectedContainerImage}</strong>
+                  </div>
+                </div>
+
+                <div className="explanation-card">
+                  <h3>Why this plan</h3>
+                  <p>{auditResult.reasoning || "No additional reasoning returned."}</p>
+                </div>
+
+                <div className="command-plan">
+                  <div className="command-chip">
+                    <span>Install</span>
+                    <code>{auditResult.installCommand ?? "Not needed"}</code>
+                  </div>
+                  <div className="command-chip">
+                    <span>Test</span>
+                    <code>{auditResult.testCommand ?? "Not detected"}</code>
+                  </div>
+                  <div className="command-chip">
+                    <span>Build</span>
+                    <code>{auditResult.buildCommand ?? "Not detected"}</code>
+                  </div>
+                  <div className="command-chip">
+                    <span>Run</span>
+                    <code>{auditResult.runCommand ?? "Not detected"}</code>
+                  </div>
+                </div>
+              </section>
+
+              <section className="panel">
+                <div className="panel-heading">
+                  <div>
+                    <p className="section-tag">Execution</p>
+                    <h2>Dynamic Analysis Commands</h2>
+                  </div>
+                </div>
+
+                <div className="command-results">
+                  {auditResult.executedCommands.length > 0 ? (
+                    auditResult.executedCommands.map((result) => (
+                      <article key={`${result.label}-${result.command}`} className="command-card">
+                        <div className="command-topline">
+                          <span className={`command-status status-${result.status}`}>
+                            {result.status}
+                          </span>
+                          <strong>{result.label}</strong>
+                          <span>{result.durationMs} ms</span>
+                        </div>
+                        <code className="command-string">{result.command}</code>
+                        <pre className="command-output">{result.outputPreview || "No terminal output captured."}</pre>
+                      </article>
+                    ))
+                  ) : (
+                    <div className="empty-state">
+                      No runnable commands were inferred for this repository.
+                    </div>
+                  )}
+                </div>
+              </section>
+
+              <section className="panel">
+                <div className="panel-heading">
+                  <div>
+                    <p className="section-tag">Findings</p>
+                    <h2>LLM Report</h2>
+                  </div>
+                </div>
+
+                <div className="summary-ribbon">
+                  <div className="summary-card">
+                    <span>Total</span>
+                    <strong>{findings.length}</strong>
+                  </div>
+                  <div className="summary-card">
+                    <span>Critical</span>
+                    <strong>{severityCounts.critical}</strong>
+                  </div>
+                  <div className="summary-card">
+                    <span>High</span>
+                    <strong>{severityCounts.high}</strong>
+                  </div>
+                  <div className="summary-card">
+                    <span>Medium</span>
+                    <strong>{severityCounts.medium}</strong>
+                  </div>
+                  <div className="summary-card">
+                    <span>Low</span>
+                    <strong>{severityCounts.low}</strong>
+                  </div>
+                </div>
+
+                <div className="report-summary">{auditResult.summary}</div>
+
+                <div className="findings-list">
+                  {findings.length > 0 ? (
+                    findings.map((finding) => (
+                      <article
+                        key={finding.id}
+                        className="finding-card"
+                        style={{
+                          borderColor: `${severityAccent[finding.severity]}55`,
+                        }}
+                      >
+                        <div className="finding-topline">
+                          <span
+                            className="severity-pill"
+                            style={{
+                              color: severityAccent[finding.severity],
+                              borderColor: `${severityAccent[finding.severity]}66`,
+                            }}
+                          >
+                            {finding.severity}
+                          </span>
+                          <span className="category-pill">{finding.category}</span>
+                          <span className="confidence-pill">
+                            {Math.round(finding.confidence * 100)}% confidence
+                          </span>
+                        </div>
+
+                        <h3>{finding.title}</h3>
+
+                        <div className="finding-meta">
+                          <span>
+                            {finding.file
+                              ? `${finding.file}${finding.line ? `:${finding.line}` : ""}`
+                              : "Location not pinned"}
+                          </span>
+                          <span>{finding.source}</span>
+                        </div>
+
+                        <p>{finding.explanation}</p>
+
+                        <div className="finding-block">
+                          <span>Evidence</span>
+                          <pre>{finding.evidence}</pre>
+                        </div>
+
+                        <div className="finding-block">
+                          <span>Suggestion</span>
+                          <p>{finding.suggestion}</p>
+                        </div>
+
+                        {finding.fixSnippet && (
+                          <div className="finding-block">
+                            <span>Suggested Fix</span>
+                            <pre>{finding.fixSnippet}</pre>
+                          </div>
+                        )}
+                      </article>
+                    ))
+                  ) : (
+                    <div className="empty-state">
+                      No findings were returned. The terminal log may still show
+                      useful execution details.
+                    </div>
+                  )}
+                </div>
+              </section>
+
+              {auditResult.warnings.length > 0 && (
+                <section className="panel warning-panel">
+                  <div className="panel-heading">
+                    <div>
+                      <p className="section-tag">Warnings</p>
+                      <h2>Audit Notes</h2>
+                    </div>
+                  </div>
+
+                  <ul className="warning-list">
+                    {auditResult.warnings.map((warning) => (
+                      <li key={warning}>{warning}</li>
+                    ))}
+                  </ul>
+                </section>
+              )}
+            </>
+          )}
+        </main>
+
+        <aside className="terminal-column">
+          <section className="terminal-shell">
+            <div className="terminal-head">
+              <div className="terminal-lights">
+                <span className="light light-red" />
+                <span className="light light-amber" />
+                <span className="light light-green" />
+              </div>
+              <div>
+                <p className="section-tag">Live Terminal</p>
+                <h2>Environment Activity</h2>
+              </div>
+            </div>
+
+            <div className="terminal-body" ref={terminalBodyRef}>
+              {terminalLines.map((line) => (
+                <div key={line.id} className={`terminal-line tone-${line.tone}`}>
+                  {line.text}
+                </div>
+              ))}
+              {auditState === "running" && (
+                <div className="terminal-line tone-output cursor-line">_</div>
               )}
             </div>
 
-            {/* Severity filter + search */}
-            {displayVulns.length > 0 && (
-              <div className="filter-bar">
-                <div className="severity-filters">
-                  {(["All", "Critical", "High", "Medium", "Low"] as SeverityFilter[]).map((sev) => (
-                    <button
-                      key={sev}
-                      className={`filter-pill ${severityFilter === sev ? "filter-active" : ""}`}
-                      style={sev !== "All" ? { "--pill-color": severityColor[sev] } as React.CSSProperties : undefined}
-                      onClick={() => setSeverityFilter(sev)}
-                    >
-                      {sev}
-                      {sev !== "All" && (
-                        <span className="filter-count">
-                          {displayVulns.filter((v) => v.severity === sev).length}
-                        </span>
-                      )}
-                    </button>
-                  ))}
-                </div>
-                <input
-                  type="text"
-                  className="search-input"
-                  placeholder="🔍 Search by file, type, description…"
-                  value={searchQuery}
-                  onChange={(e) => setSearchQuery(e.target.value)}
-                />
-              </div>
-            )}
-
-            {/* Pipeline log + terminal */}
-            {scanResult && scanResult.pipelineLog.length > 0 && (
-              <div className="pipeline-log">
-                {scanResult.pipelineLog.map((step, i) => (
-                  <div key={i} className="pipeline-step">
-                    <span className="pipeline-stage">{step.stage}</span>
-                    <span className="pipeline-msg">{step.message}</span>
-                    <span className="pipeline-time">{step.durationMs}ms</span>
-                  </div>
-                ))}
-              </div>
-            )}
-
-            {/* Post-scan terminal log (collapsed) */}
-            {scanResult && streamingLogs.length > 0 && (
-              <details className="terminal-details">
-                <summary className="terminal-summary">📟 Scanner Terminal Log ({streamingLogs.length} events)</summary>
-                <div className="terminal-panel">
-                  <div className="terminal-header">
-                    <span className="terminal-dot terminal-dot-red" />
-                    <span className="terminal-dot terminal-dot-yellow" />
-                    <span className="terminal-dot terminal-dot-green" />
-                    <span className="terminal-title">Scan Log</span>
-                  </div>
-                  <div className="terminal-body">
-                    {streamingLogs.map((log, i) => (
-                      <div key={i} className={`terminal-line ${log.includes('FOUND') ? 'terminal-warn' : log.includes('\u2714') ? 'terminal-success' : ''}`}>
-                        {log}
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              </details>
-            )}
-
-            {/* No vulns */}
-            {scanResult && scanResult.totalVulnerabilities === 0 && (
-              <div className="clean-result">
-                <h3>✅ No Vulnerabilities Found</h3>
-                <p>Your project passed all {scanResult.scannedFiles} file security checks.</p>
-              </div>
-            )}
-
-            {/* Vulnerability list */}
-            {filteredVulns.length > 0 && (
-              <div className="vuln-list">
-                {filteredVulns.map((vuln) => {
-                  const isFixed = fixedIds.has(vuln.id);
-                  const isSkipped = skippedIds.has(vuln.id);
-                  const isExpanded = expandedId === vuln.id;
-                  const isFixing = fixingId === vuln.id;
-
-                  return (
-                    <div
-                      key={vuln.id}
-                      className={`vuln-card ${isFixed ? "vuln-fixed" : ""} ${isSkipped ? "vuln-skipped" : ""}`}
-                      style={{ borderLeftColor: severityBorder[vuln.severity] ?? "#72a0ff" }}
-                    >
-                      {/* Header row */}
-                      <div
-                        className="vuln-header"
-                        onClick={() => setExpandedId(isExpanded ? null : vuln.id)}
-                      >
-                        <div className="vuln-header-left">
-                          <span
-                            className="vuln-severity"
-                            style={{ color: severityColor[vuln.severity] }}
-                          >
-                            {vuln.severity}
-                          </span>
-                          <span className="vuln-type-badge">{vuln.vulnType}</span>
-                          <span className="vuln-owasp">{vuln.owaspCategory}</span>
-                        </div>
-                        <div className="vuln-header-right">
-                          {isFixed && <span className="vuln-status-badge fixed">✅ Fixed</span>}
-                          {isSkipped && <span className="vuln-status-badge skipped">⏭️ Skipped</span>}
-                          <span className="vuln-confidence">
-                            {Math.round(vuln.confidence * 100)}% conf
-                          </span>
-                          <span className="vuln-expand">{isExpanded ? "▼" : "▶"}</span>
-                        </div>
-                      </div>
-
-                      {/* Title + location */}
-                      <div className="vuln-title">{vuln.title}</div>
-                      <div className="vuln-location">
-                        <code>{vuln.file}:{vuln.line}</code>
-                        <span className="vuln-layer">{vuln.detectionLayer}</span>
-                      </div>
-
-                      {/* Expanded content */}
-                      {isExpanded && (
-                        <div className="vuln-details">
-                          <p className="vuln-description">{vuln.description}</p>
-
-                          {vuln.aiExplanation && (
-                            <div className="ai-explanation">
-                              <strong>🧠 AI Analysis:</strong>
-                              <p>{vuln.aiExplanation}</p>
-                            </div>
-                          )}
-
-                          {/* Diff viewer */}
-                          <div className="diff-viewer">
-                            <div className="diff-panel diff-original">
-                              <div className="diff-header">❌ Vulnerable Code</div>
-                              <pre>{vuln.originalCode}</pre>
-                            </div>
-                            <div className="diff-panel diff-fixed">
-                              <div className="diff-header">✅ Fixed Code</div>
-                              <pre>{vuln.fixedCode}</pre>
-                            </div>
-                          </div>
-
-                          {/* Actions */}
-                          {!isFixed && !isSkipped && (
-                            <div className="vuln-actions">
-                              <button
-                                className="fix-btn fix-accept"
-                                onClick={(e) => { e.stopPropagation(); applyFix(vuln); }}
-                                disabled={isFixing}
-                              >
-                                {isFixing ? "Applying…" : "✅ Accept & Fix"}
-                              </button>
-                              <button
-                                className="fix-btn fix-skip"
-                                onClick={(e) => { e.stopPropagation(); skipVuln(vuln.id); }}
-                              >
-                                ⏭️ Skip
-                              </button>
-                            </div>
-                          )}
-                        </div>
-                      )}
-                    </div>
-                  );
-                })}
-              </div>
-            )}
-
-            {/* Warnings */}
-            {scanResult && scanResult.warnings.length > 0 && (
-              <div className="warning-card">
-                <h3>⚠️ Warnings</h3>
-                <ul>
-                  {scanResult.warnings.map((w, i) => (
-                    <li key={i}>{w}</li>
-                  ))}
-                </ul>
-              </div>
-            )}
-          </>
-        )}
-      </section>
+            <div className="terminal-foot">
+              <span>Terminal is always visible so clone, install, run, and analysis output stay in one place.</span>
+            </div>
+          </section>
+        </aside>
+      </div>
     </div>
   );
 }
