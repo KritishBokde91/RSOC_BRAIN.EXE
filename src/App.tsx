@@ -4,6 +4,9 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import "./App.css";
 
+/* ─────────────────────────────────────────────
+   TYPES
+───────────────────────────────────────────── */
 interface AppContext {
   workspaceRoot: string;
   defaultContainerImage: string;
@@ -89,6 +92,11 @@ interface TerminalLine {
   text: string;
 }
 
+/* ─────────────────────────────────────────────
+   CONSTANTS
+───────────────────────────────────────────── */
+const PLATFORM = "AetherVerify";
+
 const severityOrder: Record<AuditFinding["severity"], number> = {
   Critical: 0,
   High: 1,
@@ -96,21 +104,34 @@ const severityOrder: Record<AuditFinding["severity"], number> = {
   Low: 3,
 };
 
-const severityAccent: Record<AuditFinding["severity"], string> = {
-  Critical: "#ff6b6b",
-  High: "#ffb454",
-  Medium: "#ffd166",
-  Low: "#7bdff2",
-};
+const focusPresets = [
+  {
+    label: "Logic Bugs",
+    prompt:
+      "Focus on likely runtime failures, logical bugs, and risky implementation issues.",
+  },
+  {
+    label: "Security",
+    prompt:
+      "Prioritize exploit paths, unsafe defaults, insecure dependencies, and data exposure risks.",
+  },
+  {
+    label: "Stability",
+    prompt:
+      "Focus on startup failures, dependency drift, flaky tests, configuration issues, and production reliability risks.",
+  },
+];
 
+const PIPELINE_STEPS = ["Clone", "Detect", "Run", "Analyze"];
+
+/* ─────────────────────────────────────────────
+   HELPERS
+───────────────────────────────────────────── */
 function nowStamp() {
   return new Date().toLocaleTimeString("en-US", { hour12: false });
 }
 
-function makeTerminalLine(
-  tone: TerminalLine["tone"],
-  text: string,
-): TerminalLine {
+function makeLine(tone: TerminalLine["tone"], text: string): TerminalLine {
   return {
     id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
     tone,
@@ -119,563 +140,741 @@ function makeTerminalLine(
 }
 
 function appendCapped(lines: TerminalLine[], next: TerminalLine[]) {
-  const merged = [...lines, ...next];
-  return merged.slice(-450);
+  return [...lines, ...next].slice(-450);
 }
 
-function shortRunId(runId: string) {
-  return runId.slice(0, 8);
+function shortId(id: string) { return id.slice(0, 8); }
+
+function prettyDuration(ms: number) {
+  return ms < 1000 ? `${ms}ms` : `${(ms / 1000).toFixed(1)}s`;
 }
 
-function App() {
-  const [appContext, setAppContext] = useState<AppContext | null>(null);
-  const [contextError, setContextError] = useState("");
+function truncate(str: string, max = 40) {
+  if (str.length <= max) return str;
+  return `${str.slice(0, Math.floor(max / 2) - 1)}…${str.slice(-(Math.ceil(max / 2) - 1))}`;
+}
 
-  const [workspaceRoot, setWorkspaceRoot] = useState("");
-  const [repositoryUrl, setRepositoryUrl] = useState("");
-  const [containerImage, setContainerImage] = useState("");
-  const [issuePrompt, setIssuePrompt] = useState(
-    "Focus on likely runtime failures, logical bugs, and risky implementation issues.",
-  );
+function stateDesc(s: AuditState) {
+  if (s === "running")  return "Containerized checks streaming live.";
+  if (s === "complete") return "Run finished — review strategy and findings below.";
+  if (s === "error")    return "Pipeline stopped early. See terminal for details.";
+  return "Configure source, runtime, and focus to get started.";
+}
+
+/* ─────────────────────────────────────────────
+   COMPONENT
+───────────────────────────────────────────── */
+export default function App() {
+  /* state */
+  const [ctx, setCtx]             = useState<AppContext | null>(null);
+  const [ctxError, setCtxError]   = useState("");
+
+  const [workspace, setWorkspace]   = useState("");
+  const [repoUrl, setRepoUrl]       = useState("");
+  const [container, setContainer]   = useState("");
+  const [focusPrompt, setFocusPrompt] = useState(focusPresets[0].prompt);
 
   const [auditState, setAuditState] = useState<AuditState>("idle");
-  const [stageLabel, setStageLabel] = useState("Ready to inspect a repository.");
+  const [stageMsg, setStageMsg]     = useState("Ready.");
   const [auditError, setAuditError] = useState("");
-  const [auditResult, setAuditResult] = useState<RepositoryAuditResult | null>(null);
-  const [terminalLines, setTerminalLines] = useState<TerminalLine[]>([
-    makeTerminalLine(
-      "info",
-      `[${nowStamp()}] Terminal ready. Start an audit to stream clone, setup, run, and analysis output here.`,
-    ),
+  const [result, setResult]         = useState<RepositoryAuditResult | null>(null);
+  const [lines, setLines]           = useState<TerminalLine[]>([
+    makeLine("info", `[${nowStamp()}] Terminal ready. Start an audit to see live output.`),
   ]);
 
-  const terminalBodyRef = useRef<HTMLDivElement>(null);
-  const unlistenRef = useRef<UnlistenFn[]>([]);
+  const termRef      = useRef<HTMLDivElement>(null);
+  const unlistensRef = useRef<UnlistenFn[]>([]);
 
+  /* load context */
   useEffect(() => {
     invoke<AppContext>("load_app_context")
-      .then((context) => {
-        setAppContext(context);
-        setWorkspaceRoot(context.workspaceRoot);
-        setContainerImage(context.defaultContainerImage);
+      .then((c) => {
+        setCtx(c);
+        setWorkspace(c.workspaceRoot);
+        setContainer(c.defaultContainerImage);
       })
-      .catch((error) => setContextError(String(error)));
+      .catch((e) => setCtxError(String(e)));
   }, []);
 
+  /* event listeners */
   useEffect(() => {
-    let active = true;
+    let alive = true;
 
-    const attachListeners = async () => {
-      const unlistenStage = await listen<AuditStagePayload>("audit-stage", (event) => {
-        if (!active) return;
-        const line = makeTerminalLine(
-          "stage",
-          `[${nowStamp()}] ${event.payload.stage.toUpperCase()}: ${event.payload.message}`,
+    (async () => {
+      const unStage = await listen<AuditStagePayload>("audit-stage", (e) => {
+        if (!alive) return;
+        setStageMsg(e.payload.message);
+        if (e.payload.stage === "complete") setAuditState("complete");
+        setLines((prev) =>
+          appendCapped(prev, [
+            makeLine("stage", `[${nowStamp()}] ${e.payload.stage.toUpperCase()}: ${e.payload.message}`),
+          ])
         );
-        setStageLabel(event.payload.message);
-        if (event.payload.stage === "complete") {
-          setAuditState("complete");
-        }
-        setTerminalLines((current) => appendCapped(current, [line]));
       });
 
-      const unlistenStatus = await listen<SandboxStatusPayload>(
-        "sandbox-status",
-        (event) => {
-          if (!active) return;
-          const tone =
-            event.payload.stage === "failed"
-              ? "error"
-              : event.payload.stage === "completed"
-                ? "success"
-                : "info";
-          const exitSuffix =
-            event.payload.exitCode !== null ? ` (exit ${event.payload.exitCode})` : "";
-          const line = makeTerminalLine(
-            tone,
-            `[${nowStamp()}] [${shortRunId(event.payload.runId)}] ${event.payload.stage.toUpperCase()}: ${event.payload.message}${exitSuffix}`,
+      const unStatus = await listen<SandboxStatusPayload>("sandbox-status", (e) => {
+        if (!alive) return;
+        const tone = e.payload.stage === "failed"
+          ? "error"
+          : e.payload.stage === "completed"
+          ? "success"
+          : "info";
+        const exit = e.payload.exitCode !== null ? ` (exit ${e.payload.exitCode})` : "";
+        setLines((prev) =>
+          appendCapped(prev, [
+            makeLine(tone, `[${nowStamp()}] [${shortId(e.payload.runId)}] ${e.payload.stage.toUpperCase()}: ${e.payload.message}${exit}`),
+          ])
+        );
+      });
+
+      const unOutput = await listen<SandboxOutputPayload>("sandbox-output", (e) => {
+        if (!alive) return;
+        const chunks = e.payload.chunk
+          .split(/\r?\n/)
+          .map((l) => l.trimEnd())
+          .filter(Boolean)
+          .map((l) =>
+            makeLine(
+              e.payload.stream === "stderr" ? "error" : "output",
+              `[${nowStamp()}] [${shortId(e.payload.runId)}] ${l}`
+            )
           );
-          setTerminalLines((current) => appendCapped(current, [line]));
-        },
-      );
+        if (chunks.length) setLines((prev) => appendCapped(prev, chunks));
+      });
 
-      const unlistenOutput = await listen<SandboxOutputPayload>(
-        "sandbox-output",
-        (event) => {
-          if (!active) return;
-          const chunks = event.payload.chunk
-            .split(/\r?\n/)
-            .map((line) => line.trimEnd())
-            .filter(Boolean)
-            .map((line) =>
-              makeTerminalLine(
-                event.payload.stream === "stderr" ? "error" : "output",
-                `[${nowStamp()}] [${shortRunId(event.payload.runId)}] ${line}`,
-              ),
-            );
-          if (chunks.length > 0) {
-            setTerminalLines((current) => appendCapped(current, chunks));
-          }
-        },
-      );
-
-      unlistenRef.current = [unlistenStage, unlistenStatus, unlistenOutput];
-    };
-
-    attachListeners().catch((error) => {
-      setContextError(String(error));
-    });
+      unlistensRef.current = [unStage, unStatus, unOutput];
+    })().catch((e) => setCtxError(String(e)));
 
     return () => {
-      active = false;
-      for (const unlisten of unlistenRef.current) {
-        unlisten();
-      }
-      unlistenRef.current = [];
+      alive = false;
+      unlistensRef.current.forEach((fn) => fn());
+      unlistensRef.current = [];
     };
   }, []);
 
+  /* auto-scroll terminal */
   useEffect(() => {
-    const node = terminalBodyRef.current;
-    if (!node) return;
-    node.scrollTop = node.scrollHeight;
-  }, [terminalLines]);
+    const node = termRef.current;
+    if (node) node.scrollTop = node.scrollHeight;
+  }, [lines]);
 
-  const findings =
-    auditResult?.findings
-      .slice()
-      .sort((left, right) => severityOrder[left.severity] - severityOrder[right.severity]) ?? [];
+  /* derived */
+  const findings = (result?.findings ?? [])
+    .slice()
+    .sort((a, b) => severityOrder[a.severity] - severityOrder[b.severity]);
 
-  const severityCounts = {
-    critical: findings.filter((finding) => finding.severity === "Critical").length,
-    high: findings.filter((finding) => finding.severity === "High").length,
-    medium: findings.filter((finding) => finding.severity === "Medium").length,
-    low: findings.filter((finding) => finding.severity === "Low").length,
+  const counts = {
+    critical: findings.filter((f) => f.severity === "Critical").length,
+    high:     findings.filter((f) => f.severity === "High").length,
+    medium:   findings.filter((f) => f.severity === "Medium").length,
+    low:      findings.filter((f) => f.severity === "Low").length,
   };
 
-  async function browseWorkspace() {
+  const hasSource     = Boolean(repoUrl.trim() || workspace.trim());
+  const dockerOk      = ctx?.dockerAvailable ?? false;
+  const llmOk         = ctx?.llmApiKeyConfigured ?? false;
+  const wordCount     = focusPrompt.trim() ? focusPrompt.trim().split(/\s+/).length : 0;
+  const canRun        = auditState !== "running" && hasSource && dockerOk;
+  const sourceMode    = repoUrl.trim() ? "Remote URL" : "Local path";
+  const curWorkspace  = workspace.trim() || ctx?.workspaceRoot || "Not set";
+  const curContainer  = container.trim() || ctx?.defaultContainerImage || "—";
+  const topFinding    = findings[0] ?? null;
+  const cmdCount      = result?.executedCommands.length ?? 0;
+  const lastLine      = lines[lines.length - 1]?.text ?? "";
+
+  const urgentCount   = counts.critical + counts.high;
+  const followCount   = counts.medium + counts.low;
+  const runSummary    = result
+    ? findings.length > 0
+      ? `${urgentCount} urgent, ${followCount} follow-up`
+      : "No findings"
+    : "—";
+
+  const commandPlan = [
+    { label: "Install", value: result?.installCommand ?? "—" },
+    { label: "Build",   value: result?.buildCommand   ?? "—" },
+    { label: "Test",    value: result?.testCommand     ?? "—" },
+    { label: "Run",     value: result?.runCommand      ?? "—" },
+  ];
+
+  const readiness = [
+    { label: "Source", value: hasSource ? sourceMode : "Not set",         ok: hasSource },
+    { label: "Docker", value: dockerOk  ? "Connected" : "Offline",        ok: dockerOk  },
+    { label: "LLM",    value: llmOk     ? "Configured" : "Needs API key", ok: llmOk     },
+    { label: "Focus",  value: wordCount >= 8 ? "Targeted" : "Too brief",  ok: wordCount >= 8 },
+  ] as const;
+
+  const heroStats = [
+    { label: "Runtime",  value: dockerOk ? "Ready" : "Unavailable", note: ctx?.dockerMessage ?? "Checking…" },
+    { label: "Model",    value: llmOk ? (ctx?.defaultLlmModel ?? "Set") : "No key",  note: ctx?.defaultLlmBaseUrl ?? "—" },
+    { label: "Commands", value: result ? `${cmdCount}` : "—",        note: result ? `${cmdCount} steps run` : "After first run" },
+    { label: "Findings", value: result ? `${findings.length}` : "—", note: result ? runSummary : "After first run" },
+  ];
+
+  /* actions */
+  async function browse() {
     try {
-      const selected = await open({
-        directory: true,
-        multiple: false,
-        title: "Select Repository Folder",
-      });
-      if (selected && typeof selected === "string") {
-        setWorkspaceRoot(selected);
-      }
-    } catch (error) {
-      setAuditError(String(error));
-    }
+      const sel = await open({ directory: true, multiple: false, title: "Select Repository" });
+      if (sel && typeof sel === "string") setWorkspace(sel);
+    } catch (e) { setAuditError(String(e)); }
   }
 
   async function startAudit() {
-    if (!appContext) return;
-
+    if (!ctx) return;
     setAuditState("running");
     setAuditError("");
-    setAuditResult(null);
-    setStageLabel("Preparing repository analysis...");
-    setTerminalLines([
-      makeTerminalLine(
-        "stage",
-        `[${nowStamp()}] SESSION: Starting AI bug detector pipeline.`,
-      ),
-      makeTerminalLine(
-        "info",
-        `[${nowStamp()}] SOURCE: ${
-          repositoryUrl.trim() || workspaceRoot || appContext.workspaceRoot
-        }`,
-      ),
+    setResult(null);
+    setStageMsg("Preparing analysis…");
+    setLines([
+      makeLine("stage", `[${nowStamp()}] SESSION: Starting ${PLATFORM} audit pipeline.`),
+      makeLine("info",  `[${nowStamp()}] SOURCE: ${repoUrl.trim() || workspace || ctx.workspaceRoot}`),
     ]);
 
     try {
-      const result = await invoke<RepositoryAuditResult>("run_ai_repository_audit", {
-        request: {
-          workspaceRoot,
-          repositoryUrl,
-          containerImage,
-          issuePrompt,
-        },
+      const res = await invoke<RepositoryAuditResult>("run_ai_repository_audit", {
+        request: { workspaceRoot: workspace, repositoryUrl: repoUrl, containerImage: container, issuePrompt: focusPrompt },
       });
-      setAuditResult(result);
+      setResult(res);
       setAuditState("complete");
-      setStageLabel("Audit complete.");
-    } catch (error) {
-      setAuditError(String(error));
+      setStageMsg("Audit complete.");
+    } catch (e) {
+      setAuditError(String(e));
       setAuditState("error");
-      setStageLabel("Audit failed.");
-      setTerminalLines((current) =>
-        appendCapped(current, [
-          makeTerminalLine("error", `[${nowStamp()}] ERROR: ${String(error)}`),
-        ]),
-      );
+      setStageMsg("Audit failed.");
+      setLines((prev) => appendCapped(prev, [makeLine("error", `[${nowStamp()}] ERROR: ${String(e)}`)]));
     }
   }
 
+  /* ── RENDER ── */
   return (
-    <div className="app-shell">
-      <header className="hero">
-        <div className="hero-copy">
-          <p className="eyebrow">AI / ML Code Analysis</p>
-          <h1>AI Bug Detector</h1>
-          <p className="hero-text">
-            Clone a repository into an isolated environment, let the LLM infer
-            the stack and the safest way to run it, execute dynamic checks in
-            Docker, and turn the terminal evidence into actionable bug and
-            vulnerability suggestions.
-          </p>
-        </div>
+    <div className="av-app">
 
-        <div className="hero-metrics">
-          <div className="metric-card">
-            <span className="metric-label">Docker</span>
-            <strong>{appContext?.dockerAvailable ? "Ready" : "Unavailable"}</strong>
-            <p>{appContext?.dockerMessage ?? "Checking Docker..."}</p>
+      {/* ══ TOPBAR ══ */}
+      <nav className="topbar">
+        <div className="topbar-inner">
+          <div className="brand">
+            <div className="brand-mark">AV</div>
+            <span className="brand-name">
+              {PLATFORM}
+              <span className="brand-slash"> / </span>
+              <span className="brand-sub">Audit Command Center</span>
+            </span>
           </div>
-          <div className="metric-card">
-            <span className="metric-label">LLM</span>
-            <strong>
-              {appContext?.llmApiKeyConfigured
-                ? appContext.defaultLlmModel || "Configured"
-                : "Needs API key"}
-            </strong>
-            <p>{appContext?.defaultLlmBaseUrl ?? "No endpoint configured"}</p>
-          </div>
-          <div className="metric-card">
-            <span className="metric-label">Process</span>
-            <strong>{"Clone -> Detect -> Run -> Analyze"}</strong>
-            <p>Terminal stays visible during the full pipeline.</p>
+          <div className="topbar-pills">
+            <span className="pill">{sourceMode}</span>
+            <span className="pill">{dockerOk ? "Docker linked" : "Docker offline"}</span>
+            <span className={`pill state-${auditState}`}>
+              <span className="pill-dot" />
+              {auditState}
+            </span>
           </div>
         </div>
-      </header>
+      </nav>
 
-      {(contextError || auditError) && (
-        <div className="error-banner">{contextError || auditError}</div>
-      )}
+      <div className="av-shell">
 
-      <div className="surface-grid">
-        <main className="main-column">
-          <section className="panel controls-panel">
-            <div className="panel-heading">
-              <div>
-                <p className="section-tag">Input</p>
-                <h2>Repository Source</h2>
+        {/* ══ HERO STRIP ══ */}
+        <div className="hero-strip">
+          <div className="hero-strip-inner">
+            <div>
+              <h1 className="hero-heading">
+                Repository<br />
+                audit <em>command</em><br />
+                center.
+              </h1>
+              <div className="pipeline">
+                {PIPELINE_STEPS.map((step, i) => (
+                  <div key={step} className="pipe-step">
+                    <span className="pipe-num">0{i + 1}</span>
+                    {step}
+                  </div>
+                ))}
               </div>
-              <button
-                className="primary-btn"
-                onClick={startAudit}
-                disabled={
-                  auditState === "running" ||
-                  (!repositoryUrl.trim() && !workspaceRoot.trim())
-                }
-              >
-                {auditState === "running" ? "Analyzing..." : "Clone, Run & Analyze"}
-              </button>
             </div>
+            <div className="hero-aside">
+              <span className={`pill state-${auditState}`}>
+                <span className="pill-dot" />
+                {auditState}
+              </span>
+              <p className="hero-status-text">{stateDesc(auditState)}</p>
+            </div>
+          </div>
+        </div>
 
-            <label className="field">
-              <span>Local Workspace</span>
-              <div className="input-row">
-                <input
-                  value={workspaceRoot}
-                  onChange={(event) => setWorkspaceRoot(event.target.value)}
-                  placeholder="/path/to/local/repository"
-                  disabled={auditState === "running"}
-                />
-                <button
-                  className="secondary-btn"
-                  onClick={browseWorkspace}
-                  disabled={auditState === "running"}
-                >
-                  Browse
-                </button>
+        {/* ══ STATS BAR ══ */}
+        <div className="stats-bar anim-up anim-up-1" style={{ marginBottom: 20 }}>
+          {heroStats.map((s) => (
+            <div key={s.label} className="stat-cell">
+              <div className="stat-label">{s.label}</div>
+              <div className="stat-value" title={s.value}>{truncate(s.value, 18)}</div>
+              <div className="stat-note" title={s.note}>{s.note}</div>
+            </div>
+          ))}
+        </div>
+
+        {/* ══ ERROR ══ */}
+        {(ctxError || auditError) && (
+          <div className="error-banner">{ctxError || auditError}</div>
+        )}
+
+        {/* ══ WORKSPACE ══ */}
+        <div className="workspace anim-up anim-up-2">
+
+          {/* ── MAIN COLUMN ── */}
+          <div className="main-col">
+
+            {/* INTAKE PANEL */}
+            <section className="card intake-panel">
+              <div className="card-header">
+                <div className="card-header-row">
+                  <div>
+                    <p className="section-eyebrow">Source &amp; Runtime</p>
+                    <h2 className="section-title">Configure the audit target and focus.</h2>
+                  </div>
+                  <span className="header-badge">intake</span>
+                </div>
               </div>
-              <small>
-                Primary input. The app copies this workspace into an isolated
-                Docker environment and runs the next steps there.
-              </small>
-            </label>
 
-            <label className="field">
-              <span>Repository URL (Optional)</span>
-              <input
-                value={repositoryUrl}
-                onChange={(event) => setRepositoryUrl(event.target.value)}
-                placeholder="https://github.com/org/project.git"
-                disabled={auditState === "running"}
-              />
-              <small>
-                Only use this when the code is not already available locally.
-              </small>
-            </label>
-
-            <label className="field">
-              <span>Container Image Override</span>
-              <input
-                value={containerImage}
-                onChange={(event) => setContainerImage(event.target.value)}
-                placeholder={appContext?.defaultContainerImage ?? "node:22-bookworm"}
-                disabled={auditState === "running"}
-              />
-              <small>
-                Leave this as-is to use the default, or override it when you
-                already know the runtime you want.
-              </small>
-            </label>
-
-            <label className="field">
-              <span>Audit Focus</span>
-              <textarea
-                value={issuePrompt}
-                onChange={(event) => setIssuePrompt(event.target.value)}
-                rows={4}
-                disabled={auditState === "running"}
-              />
-            </label>
-
-            <div className="status-strip">
-              <span className={`state-pill state-${auditState}`}>{auditState}</span>
-              <span>{stageLabel}</span>
-            </div>
-          </section>
-
-          {auditResult && (
-            <>
-              <section className="panel">
-                <div className="panel-heading">
-                  <div>
-                    <p className="section-tag">Detection</p>
-                    <h2>Runtime Strategy</h2>
-                  </div>
-                </div>
-
-                <div className="facts-grid">
-                  <div className="fact-card">
-                    <span>Project Type</span>
-                    <strong>{auditResult.detectedProjectType}</strong>
-                  </div>
-                  <div className="fact-card">
-                    <span>Primary Language</span>
-                    <strong>{auditResult.primaryLanguage}</strong>
-                  </div>
-                  <div className="fact-card">
-                    <span>Source</span>
-                    <strong>{auditResult.sourceKind}</strong>
-                  </div>
-                  <div className="fact-card">
-                    <span>Container</span>
-                    <strong>{auditResult.selectedContainerImage}</strong>
-                  </div>
-                </div>
-
-                <div className="explanation-card">
-                  <h3>Why this plan</h3>
-                  <p>{auditResult.reasoning || "No additional reasoning returned."}</p>
-                </div>
-
-                <div className="command-plan">
-                  <div className="command-chip">
-                    <span>Install</span>
-                    <code>{auditResult.installCommand ?? "Not needed"}</code>
-                  </div>
-                  <div className="command-chip">
-                    <span>Test</span>
-                    <code>{auditResult.testCommand ?? "Not detected"}</code>
-                  </div>
-                  <div className="command-chip">
-                    <span>Build</span>
-                    <code>{auditResult.buildCommand ?? "Not detected"}</code>
-                  </div>
-                  <div className="command-chip">
-                    <span>Run</span>
-                    <code>{auditResult.runCommand ?? "Not detected"}</code>
-                  </div>
-                </div>
-              </section>
-
-              <section className="panel">
-                <div className="panel-heading">
-                  <div>
-                    <p className="section-tag">Execution</p>
-                    <h2>Dynamic Analysis Commands</h2>
-                  </div>
-                </div>
-
-                <div className="command-results">
-                  {auditResult.executedCommands.length > 0 ? (
-                    auditResult.executedCommands.map((result) => (
-                      <article key={`${result.label}-${result.command}`} className="command-card">
-                        <div className="command-topline">
-                          <span className={`command-status status-${result.status}`}>
-                            {result.status}
-                          </span>
-                          <strong>{result.label}</strong>
-                          <span>{result.durationMs} ms</span>
-                        </div>
-                        <code className="command-string">{result.command}</code>
-                        <pre className="command-output">{result.outputPreview || "No terminal output captured."}</pre>
-                      </article>
-                    ))
-                  ) : (
-                    <div className="empty-state">
-                      No runnable commands were inferred for this repository.
+              <div className="intake-body">
+                {/* Fields */}
+                <div className="field-group">
+                  <div className="field">
+                    <label className="field-label">Local Workspace</label>
+                    <span className="field-hint">Path to a local repository on this machine.</span>
+                    <div className="input-wrap">
+                      <input
+                        className="av-input"
+                        value={workspace}
+                        onChange={(e) => setWorkspace(e.target.value)}
+                        placeholder="/path/to/repo"
+                        disabled={auditState === "running"}
+                      />
+                      <button className="btn-ghost" onClick={browse} disabled={auditState === "running"}>
+                        Browse
+                      </button>
                     </div>
-                  )}
-                </div>
-              </section>
+                  </div>
 
-              <section className="panel">
-                <div className="panel-heading">
-                  <div>
-                    <p className="section-tag">Findings</p>
-                    <h2>LLM Report</h2>
+                  <div className="field">
+                    <label className="field-label">Repository URL</label>
+                    <span className="field-hint">Clone into the Docker sandbox instead.</span>
+                    <input
+                      className="av-input"
+                      value={repoUrl}
+                      onChange={(e) => setRepoUrl(e.target.value)}
+                      placeholder="https://github.com/org/project.git"
+                      disabled={auditState === "running"}
+                    />
                   </div>
-                </div>
 
-                <div className="summary-ribbon">
-                  <div className="summary-card">
-                    <span>Total</span>
-                    <strong>{findings.length}</strong>
-                  </div>
-                  <div className="summary-card">
-                    <span>Critical</span>
-                    <strong>{severityCounts.critical}</strong>
-                  </div>
-                  <div className="summary-card">
-                    <span>High</span>
-                    <strong>{severityCounts.high}</strong>
-                  </div>
-                  <div className="summary-card">
-                    <span>Medium</span>
-                    <strong>{severityCounts.medium}</strong>
-                  </div>
-                  <div className="summary-card">
-                    <span>Low</span>
-                    <strong>{severityCounts.low}</strong>
-                  </div>
-                </div>
-
-                <div className="report-summary">{auditResult.summary}</div>
-
-                <div className="findings-list">
-                  {findings.length > 0 ? (
-                    findings.map((finding) => (
-                      <article
-                        key={finding.id}
-                        className="finding-card"
-                        style={{
-                          borderColor: `${severityAccent[finding.severity]}55`,
-                        }}
+                  <div className="field">
+                    <label className="field-label">Container Image</label>
+                    <span className="field-hint">Override the auto-detected runtime image.</span>
+                    <div className="input-wrap">
+                      <input
+                        className="av-input"
+                        value={container}
+                        onChange={(e) => setContainer(e.target.value)}
+                        placeholder={ctx?.defaultContainerImage ?? "node:22-bookworm"}
+                        disabled={auditState === "running"}
+                      />
+                      <button
+                        className="btn-ghost"
+                        onClick={() => setContainer(ctx?.defaultContainerImage ?? "")}
+                        disabled={auditState === "running" || !ctx}
                       >
-                        <div className="finding-topline">
-                          <span
-                            className="severity-pill"
-                            style={{
-                              color: severityAccent[finding.severity],
-                              borderColor: `${severityAccent[finding.severity]}66`,
-                            }}
-                          >
-                            {finding.severity}
-                          </span>
-                          <span className="category-pill">{finding.category}</span>
-                          <span className="confidence-pill">
-                            {Math.round(finding.confidence * 100)}% confidence
-                          </span>
-                        </div>
-
-                        <h3>{finding.title}</h3>
-
-                        <div className="finding-meta">
-                          <span>
-                            {finding.file
-                              ? `${finding.file}${finding.line ? `:${finding.line}` : ""}`
-                              : "Location not pinned"}
-                          </span>
-                          <span>{finding.source}</span>
-                        </div>
-
-                        <p>{finding.explanation}</p>
-
-                        <div className="finding-block">
-                          <span>Evidence</span>
-                          <pre>{finding.evidence}</pre>
-                        </div>
-
-                        <div className="finding-block">
-                          <span>Suggestion</span>
-                          <p>{finding.suggestion}</p>
-                        </div>
-
-                        {finding.fixSnippet && (
-                          <div className="finding-block">
-                            <span>Suggested Fix</span>
-                            <pre>{finding.fixSnippet}</pre>
-                          </div>
-                        )}
-                      </article>
-                    ))
-                  ) : (
-                    <div className="empty-state">
-                      No findings were returned. The terminal log may still show
-                      useful execution details.
-                    </div>
-                  )}
-                </div>
-              </section>
-
-              {auditResult.warnings.length > 0 && (
-                <section className="panel warning-panel">
-                  <div className="panel-heading">
-                    <div>
-                      <p className="section-tag">Warnings</p>
-                      <h2>Audit Notes</h2>
+                        Default
+                      </button>
                     </div>
                   </div>
 
-                  <ul className="warning-list">
-                    {auditResult.warnings.map((warning) => (
-                      <li key={warning}>{warning}</li>
-                    ))}
-                  </ul>
-                </section>
-              )}
-            </>
-          )}
-        </main>
-
-        <aside className="terminal-column">
-          <section className="terminal-shell">
-            <div className="terminal-head">
-              <div className="terminal-lights">
-                <span className="light light-red" />
-                <span className="light light-amber" />
-                <span className="light light-green" />
-              </div>
-              <div>
-                <p className="section-tag">Live Terminal</p>
-                <h2>Environment Activity</h2>
-              </div>
-            </div>
-
-            <div className="terminal-body" ref={terminalBodyRef}>
-              {terminalLines.map((line) => (
-                <div key={line.id} className={`terminal-line tone-${line.tone}`}>
-                  {line.text}
+                  <div className="field">
+                    <label className="field-label">Audit Focus</label>
+                    <span className="field-hint">Narrow the review angle before the first command starts.</span>
+                    <textarea
+                      className="av-textarea"
+                      value={focusPrompt}
+                      onChange={(e) => setFocusPrompt(e.target.value)}
+                      rows={4}
+                      disabled={auditState === "running"}
+                    />
+                    <div className="preset-row">
+                      {focusPresets.map((p) => (
+                        <button
+                          key={p.label}
+                          className={`preset-chip${focusPrompt.trim() === p.prompt ? " is-active" : ""}`}
+                          onClick={() => setFocusPrompt(p.prompt)}
+                          disabled={auditState === "running"}
+                        >
+                          {p.label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
                 </div>
-              ))}
-              {auditState === "running" && (
-                <div className="terminal-line tone-output cursor-line">_</div>
-              )}
+
+                {/* Run Profile */}
+                <div className="card-inset run-profile">
+                  <p className="profile-heading">Run Profile</p>
+                  {[
+                    { label: "Source mode",    value: hasSource ? sourceMode : "Choose source" },
+                    { label: "Focus density",  value: `${wordCount} words` },
+                    { label: "LLM",            value: llmOk ? "Connected" : "Needs setup" },
+                    { label: "Image",          value: truncate(curContainer, 26) },
+                    { label: "Workspace",      value: truncate(curWorkspace, 26) },
+                  ].map((row) => (
+                    <div key={row.label} className="profile-row">
+                      <div className="profile-row-label">{row.label}</div>
+                      <div className="profile-row-value" title={row.value}>{row.value}</div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </section>
+
+            {/* EMPTY / RESULTS */}
+            {!result ? (
+              <section className="card empty-state anim-up anim-up-3">
+                <div className="empty-blocks">
+                  <div className="empty-block" />
+                  <div className="empty-block" />
+                  <div className="empty-block" />
+                  <div className="empty-block" />
+                </div>
+                <div>
+                  <h3 className="empty-heading">Results appear after the first run.</h3>
+                  <p className="empty-body">
+                    Strategy, execution evidence, findings, and warnings will
+                    stack here in review order once the pipeline completes.
+                  </p>
+                </div>
+              </section>
+            ) : (
+              <>
+                {/* SNAPSHOT */}
+                <section className="card anim-up">
+                  <div className="card-header">
+                    <div className="card-header-row">
+                      <div>
+                        <p className="section-eyebrow">Audit Snapshot</p>
+                        <h2 className="section-title">{runSummary}</h2>
+                      </div>
+                      <span className="header-badge">complete</span>
+                    </div>
+                  </div>
+                  <div className="panel-body">
+                    <div className="snapshot-bar">
+                      <div className="snap-cell">
+                        <div className="snap-label">Total</div>
+                        <div className="snap-value">{findings.length}</div>
+                      </div>
+                      <div className="snap-cell sev-critical">
+                        <div className="snap-label">Critical</div>
+                        <div className="snap-value">{counts.critical}</div>
+                      </div>
+                      <div className="snap-cell sev-high">
+                        <div className="snap-label">High</div>
+                        <div className="snap-value">{counts.high}</div>
+                      </div>
+                      <div className="snap-cell sev-medium">
+                        <div className="snap-label">Medium</div>
+                        <div className="snap-value">{counts.medium}</div>
+                      </div>
+                      <div className="snap-cell sev-low">
+                        <div className="snap-label">Low</div>
+                        <div className="snap-value">{counts.low}</div>
+                      </div>
+                    </div>
+                    {result.summary && (
+                      <div className="snap-summary">{result.summary}</div>
+                    )}
+                  </div>
+                </section>
+
+                {/* RUNTIME STRATEGY */}
+                <section className="card">
+                  <div className="card-header">
+                    <div className="card-header-row">
+                      <div>
+                        <p className="section-eyebrow">Runtime Strategy</p>
+                        <h2 className="section-title">Project profile and command plan.</h2>
+                      </div>
+                    </div>
+                  </div>
+                  <div className="panel-body">
+                    <div className="strategy-grid">
+                      {[
+                        { label: "Project type",    value: result.detectedProjectType },
+                        { label: "Language",        value: result.primaryLanguage },
+                        { label: "Source",          value: result.sourceKind },
+                        { label: "Container",       value: truncate(result.selectedContainerImage, 28) },
+                      ].map((f) => (
+                        <div key={f.label} className="fact-tile">
+                          <div className="fact-label">{f.label}</div>
+                          <div className="fact-value" title={f.value}>{f.value}</div>
+                        </div>
+                      ))}
+                    </div>
+
+                    {result.reasoning && (
+                      <div className="reasoning-box">
+                        <div className="reasoning-label">Why this plan</div>
+                        <p className="reasoning-text">{result.reasoning}</p>
+                      </div>
+                    )}
+
+                    <div className="command-chips">
+                      {commandPlan.map((c) => (
+                        <div key={c.label} className="cmd-chip">
+                          <div className="cmd-chip-label">{c.label}</div>
+                          <div className="cmd-chip-value" title={c.value || "—"}>{c.value || "—"}</div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                </section>
+
+                {/* EXECUTION EVIDENCE */}
+                <section className="card">
+                  <div className="card-header">
+                    <div className="card-header-row">
+                      <div>
+                        <p className="section-eyebrow">Execution Evidence</p>
+                        <h2 className="section-title">Every dynamic command with status and output.</h2>
+                      </div>
+                      <span className="header-badge">{cmdCount} steps</span>
+                    </div>
+                  </div>
+                  <div className="panel-body">
+                    {result.executedCommands.length > 0 ? (
+                      <div className="cmd-results">
+                        {result.executedCommands.map((cmd) => (
+                          <div key={`${cmd.label}-${cmd.command}`} className="cmd-card">
+                            <div className="cmd-card-top">
+                              <span className={`cmd-status ${cmd.status}`}>
+                                {cmd.status.replace("_", " ")}
+                              </span>
+                              <span className="cmd-name" title={cmd.label}>{cmd.label}</span>
+                              <span className="cmd-duration">{prettyDuration(cmd.durationMs)}</span>
+                            </div>
+                            <div className="cmd-string" title={cmd.command}>{cmd.command}</div>
+                            <pre className="cmd-output">
+                              {cmd.outputPreview || "No output captured."}
+                            </pre>
+                          </div>
+                        ))}
+                      </div>
+                    ) : (
+                      <div className="empty-placeholder">No runnable commands inferred for this repository.</div>
+                    )}
+                  </div>
+                </section>
+
+                {/* FINDINGS */}
+                <section className="card">
+                  <div className="card-header">
+                    <div className="card-header-row">
+                      <div>
+                        <p className="section-eyebrow">Findings</p>
+                        <h2 className="section-title">Ranked by severity, with evidence and next steps.</h2>
+                      </div>
+                      <span className="header-badge">{findings.length} total</span>
+                    </div>
+                  </div>
+                  <div className="panel-body">
+                    {findings.length > 0 ? (
+                      <div className="findings-list">
+                        {findings.map((f) => (
+                          <article
+                            key={f.id}
+                            className={`finding-card sev-${f.severity.toLowerCase()}`}
+                          >
+                            <div className="finding-header">
+                              <span className={`sev-badge ${f.severity.toLowerCase()}`}>
+                                {f.severity}
+                              </span>
+                              <span className="cat-badge">{f.category}</span>
+                              <span className="conf-badge">
+                                {Math.round(f.confidence * 100)}% confidence
+                              </span>
+                            </div>
+
+                            <h3 className="finding-title">{f.title}</h3>
+
+                            <div className="finding-location">
+                              <span>
+                                {f.file
+                                  ? `${truncate(f.file, 48)}${f.line ? `:${f.line}` : ""}`
+                                  : "Location not pinned"}
+                              </span>
+                              <span>{f.source}</span>
+                            </div>
+
+                            <p className="finding-explanation">{f.explanation}</p>
+
+                            <div className="finding-block">
+                              <div className="finding-block-label">Evidence</div>
+                              <pre>{f.evidence}</pre>
+                            </div>
+
+                            <div className="finding-block">
+                              <div className="finding-block-label">Suggestion</div>
+                              <p>{f.suggestion}</p>
+                            </div>
+
+                            {f.fixSnippet && (
+                              <div className="finding-block">
+                                <div className="finding-block-label">Suggested fix</div>
+                                <pre>{f.fixSnippet}</pre>
+                              </div>
+                            )}
+                          </article>
+                        ))}
+                      </div>
+                    ) : (
+                      <div className="empty-placeholder">
+                        No findings returned. Check the terminal for execution evidence.
+                      </div>
+                    )}
+                  </div>
+                </section>
+
+                {/* WARNINGS */}
+                {result.warnings.length > 0 && (
+                  <div className="warnings-panel">
+                    <div className="warnings-title">Audit notes</div>
+                    <ul className="warnings-list">
+                      {result.warnings.map((w) => <li key={w}>{w}</li>)}
+                    </ul>
+                  </div>
+                )}
+              </>
+            )}
+          </div>
+
+          {/* ── RAIL COLUMN ── */}
+          <div className="rail-col">
+
+            {/* LAUNCH DECK */}
+            <section className="card launch-deck">
+              <div style={{ marginBottom: 16 }}>
+                <p className="section-eyebrow">Launch Deck</p>
+                <h2 className="section-title">Confirm readiness and run.</h2>
+              </div>
+
+              <div className="readiness-grid">
+                {readiness.map((r) => (
+                  <div key={r.label} className={`check-tile ${r.ok ? "ok" : "warn"}`}>
+                    <div className="check-label">{r.label}</div>
+                    <div className="check-value">{r.value}</div>
+                  </div>
+                ))}
+              </div>
+
+              <button
+                className="launch-btn"
+                onClick={startAudit}
+                disabled={!canRun}
+              >
+                {auditState === "running" ? `${PLATFORM} running…` : "Clone, Run & Analyze →"}
+              </button>
+
+              <div className="stage-display">
+                <div className="stage-label-text">Current stage</div>
+                <div className="stage-value-text">{stageMsg}</div>
+              </div>
+
+              <div className="pipe-list">
+                {PIPELINE_STEPS.map((step, i) => (
+                  <div key={step} className="pipe-list-item">
+                    <span className="pipe-list-num">0{i + 1}</span>
+                    <span className="pipe-list-text">{step}</span>
+                  </div>
+                ))}
+              </div>
+            </section>
+
+            {/* TERMINAL */}
+            <div className="terminal">
+              <div className="terminal-topbar">
+                <div className="terminal-title">
+                  <div className="terminal-dots">
+                    <div className="terminal-dot" />
+                    <div className="terminal-dot" />
+                    <div className="terminal-dot" />
+                  </div>
+                  <span className="terminal-name">{PLATFORM} — live output</span>
+                </div>
+                <div className="terminal-meta-row">
+                  <span className="terminal-badge">{lines.length} lines</span>
+                  <span className="terminal-badge">
+                    {auditState === "running" ? "streaming" : auditState === "complete" ? "captured" : "ready"}
+                  </span>
+                </div>
+              </div>
+
+              <div className="terminal-body" ref={termRef}>
+                {lines.map((line) => (
+                  <div key={line.id} className={`term-line term-${line.tone}`}>
+                    {line.text}
+                  </div>
+                ))}
+                {auditState === "running" && (
+                  <div className="term-line term-cursor">█</div>
+                )}
+              </div>
+
+              <div className="terminal-footer">
+                <div className="terminal-last-label">Latest event</div>
+                <div className="terminal-last-text">{lastLine}</div>
+              </div>
             </div>
 
-            <div className="terminal-foot">
-              <span>Terminal is always visible so clone, install, run, and analysis output stay in one place.</span>
-            </div>
-          </section>
-        </aside>
+            {/* SPOTLIGHT */}
+            <section className="card spotlight">
+              <div className="card-header-row" style={{ padding: "0 0 0 0", marginBottom: 0 }}>
+                <div>
+                  <p className="section-eyebrow">{topFinding ? "Top Finding" : `${PLATFORM} Brief`}</p>
+                  <h2 className="section-title" style={{ fontSize: "1rem" }}>
+                    {topFinding
+                      ? topFinding.title
+                      : "Intake, terminal, and findings in one flow."}
+                  </h2>
+                </div>
+              </div>
+
+              {topFinding ? (
+                <div className={`spotlight-box sev-${topFinding.severity.toLowerCase()}`}>
+                  <div className="spotlight-meta-row">
+                    <span className={`sev-badge ${topFinding.severity.toLowerCase()}`}>
+                      {topFinding.severity}
+                    </span>
+                    <span className="cat-badge">{topFinding.category}</span>
+                  </div>
+                  <p className="spotlight-body">{topFinding.explanation}</p>
+                  <div className="spotlight-divider" />
+                  <div className="spotlight-label">Suggested move</div>
+                  <p className="spotlight-body" style={{ fontSize: "12px" }}>{topFinding.suggestion}</p>
+                </div>
+              ) : (
+                <div className="spotlight-box">
+                  {[
+                    { key: "Source",    val: hasSource ? sourceMode : "Not selected" },
+                    { key: "Workspace", val: truncate(curWorkspace, 28) },
+                    { key: "Model",     val: ctx?.defaultLlmModel ?? "Not configured" },
+                    { key: "Runtime",   val: truncate(curContainer, 28) },
+                  ].map((item) => (
+                    <div key={item.key} className="brief-item">
+                      <span className="brief-key">{item.key}</span>
+                      <span className="brief-val" title={item.val}>{item.val}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </section>
+          </div>
+        </div>
       </div>
     </div>
   );
 }
-
-export default App;
