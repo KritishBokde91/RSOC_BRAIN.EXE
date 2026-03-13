@@ -329,6 +329,10 @@ h1, h2, h3, h4 { font-family: "Syne", sans-serif; margin: 0; }
   gap: 20px;
 }
 
+.rail-col {
+  position: relative;
+}
+
 /* ═══════════════════════════════════════════════
    SECTION LABELS
 ═══════════════════════════════════════════════ */
@@ -766,6 +770,8 @@ h1, h2, h3, h4 { font-family: "Syne", sans-serif; margin: 0; }
 .terminal {
   position: sticky;
   top: 72px;
+  align-self: flex-start;
+  z-index: 2;
   background: #080810;
   border: 1.5px solid var(--border);
   border-radius: var(--r-lg);
@@ -883,6 +889,8 @@ h1, h2, h3, h4 { font-family: "Syne", sans-serif; margin: 0; }
 ═══════════════════════════════════════════════ */
 .spotlight {
   padding: 20px;
+  position: relative;
+  z-index: 1;
 }
 
 .spotlight-box {
