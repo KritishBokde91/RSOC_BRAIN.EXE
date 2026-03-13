@@ -1,12 +1,12 @@
-import { useEffect, useEffectEvent, useRef, useState } from "react";
+import { useState, useCallback, useRef, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
-import { FitAddon } from "@xterm/addon-fit";
-import { Terminal } from "@xterm/xterm";
-import "@xterm/xterm/css/xterm.css";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { open } from "@tauri-apps/plugin-dialog";
 import "./App.css";
 
-type AppContext = {
+/* ── Tauri response types ─────────────────────────────────────────── */
+
+interface AppContext {
   workspaceRoot: string;
   defaultContainerImage: string;
   dockerAvailable: boolean;
@@ -18,1009 +18,631 @@ type AppContext = {
   defaultLlmBaseUrl: string;
   defaultLlmModel: string;
   llmApiKeyConfigured: boolean;
-};
-
-type SandboxRunHandle = {
-  runId: string;
-};
-
-type SandboxOutputEvent = {
-  runId: string;
-  stream: "stdout" | "stderr";
-  chunk: string;
-};
-
-type SandboxStatusEvent = {
-  runId: string;
-  stage: string;
-  message: string;
-  exitCode?: number | null;
-};
-
-type IngestionSummary = {
-  workspaceRoot: string;
-  scannedFiles: number;
-  symbolCount: number;
-  callEdgeCount: number;
-  inheritanceEdgeCount: number;
-  storedToNeo4j: boolean;
-  neo4jStatus: string;
-  warnings: string[];
-  symbolPreview: Array<{
-    name: string;
-    kind: string;
-    language: string;
-    filePath: string;
-    line: number;
-  }>;
-};
-
-type ContextIndexSummary = {
-  workspaceRoot: string;
-  indexPath: string;
-  indexedFiles: number;
-  chunkCount: number;
-  totalSourceBytes: number;
-  embeddingModel: string;
-  warnings: string[];
-};
-
-type RetrievedContext = {
-  filePath: string;
-  language: string;
-  startLine: number;
-  endLine: number;
-  score: number;
-  vectorScore: number;
-  lexicalScore: number;
-  rerankScore?: number | null;
-  snippet: string;
-};
-
-type IssueAnalysisResponse = {
-  workspaceRoot: string;
-  indexStatus: string;
-  llmStatus: string;
-  embeddingModel: string;
-  rerankerModel: string;
-  llmModel: string;
-  promptPreview: string;
-  answer?: string | null;
-  warnings: string[];
-  retrievedContext: RetrievedContext[];
-};
-
-function formatMegabytes(bytes: number) {
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
+interface SecurityVulnerability {
+  id: string;
+  file: string;
+  line: number;
+  endLine: number;
+  severity: string;
+  owaspCategory: string;
+  vulnType: string;
+  title: string;
+  description: string;
+  originalCode: string;
+  fixedCode: string;
+  confidence: number;
+  aiExplanation: string | null;
+  detectionLayer: string;
+}
+
+interface PipelineStep {
+  stage: string;
+  message: string;
+  durationMs: number;
+}
+
+interface FullScanResult {
+  workspaceRoot: string;
+  scannedFiles: number;
+  totalVulnerabilities: number;
+  criticalCount: number;
+  highCount: number;
+  mediumCount: number;
+  lowCount: number;
+  vulnerabilities: SecurityVulnerability[];
+  pipelineLog: PipelineStep[];
+  warnings: string[];
+}
+
+interface FixResult {
+  success: boolean;
+  message: string;
+}
+
+/* ── Streaming event payloads ─────────────────────────────────────── */
+
+interface ScanStagePayload {
+  stage: string;
+  message: string;
+  durationMs: number;
+}
+
+interface ScanProgressPayload {
+  currentFile: string;
+  scannedSoFar: number;
+  vulnsFoundSoFar: number;
+}
+
+/* ── Helpers ───────────────────────────────────────────────────── */
+
+const severityColor: Record<string, string> = {
+  Critical: "#ff4757",
+  High: "#ffa502",
+  Medium: "#f7c35f",
+  Low: "#72a0ff",
+};
+
+const severityBorder: Record<string, string> = {
+  Critical: "rgba(255, 71, 87, 0.6)",
+  High: "rgba(255, 165, 2, 0.5)",
+  Medium: "rgba(247, 195, 95, 0.4)",
+  Low: "rgba(114, 160, 255, 0.3)",
+};
+
+type ScanStage =
+  | "idle"
+  | "scanning"
+  | "analyzing"
+  | "complete"
+  | "error";
+
+type SeverityFilter = "All" | "Critical" | "High" | "Medium" | "Low";
+
+/* ── App ──────────────────────────────────────────────────────────── */
+
 function App() {
-  const terminalHostRef = useRef<HTMLDivElement | null>(null);
-  const terminalRef = useRef<Terminal | null>(null);
-  const fitAddonRef = useRef<FitAddon | null>(null);
-  const activeRunIdRef = useRef<string | null>(null);
-  const hasPrintedBootstrapStatusRef = useRef(false);
-  const lastPrintedSystemMessageRef = useRef("");
+  // Context
   const [appContext, setAppContext] = useState<AppContext | null>(null);
-  const [workspaceRoot, setWorkspaceRoot] = useState("");
-  const [sandboxImage, setSandboxImage] = useState("node:22-bookworm");
-  const [sandboxCommand, setSandboxCommand] = useState(
-    "npm --version && node --version",
-  );
-  const [sandboxStage, setSandboxStage] = useState("idle");
-  const [sandboxMessage, setSandboxMessage] = useState(
-    "Ready to execute inside Docker.",
-  );
-  const [activeRunId, setActiveRunId] = useState<string | null>(null);
-  const [neo4jUri, setNeo4jUri] = useState("");
-  const [neo4jUsername, setNeo4jUsername] = useState("");
-  const [neo4jPassword, setNeo4jPassword] = useState("");
-  const [ollamaHost, setOllamaHost] = useState("http://127.0.0.1:11434");
-  const [embeddingModel, setEmbeddingModel] = useState(
-    "snowflake-arctic-embed2:latest",
-  );
-  const [rerankerModel, setRerankerModel] = useState("");
-  const [llmBaseUrl, setLlmBaseUrl] = useState("https://api.groq.com/openai/v1");
-  const [llmModel, setLlmModel] = useState("qwen/qwen3-32b");
-  const [llmApiKey, setLlmApiKey] = useState("");
-  const [issuePrompt, setIssuePrompt] = useState(
-    "Describe the bug, failing test, or behavior you want to diagnose.",
-  );
-  const [ingestionSummary, setIngestionSummary] = useState<IngestionSummary | null>(null);
-  const [indexSummary, setIndexSummary] = useState<ContextIndexSummary | null>(null);
-  const [analysisResponse, setAnalysisResponse] = useState<IssueAnalysisResponse | null>(null);
-  const [isLoadingContext, setIsLoadingContext] = useState(true);
-  const [isStartingSandbox, setIsStartingSandbox] = useState(false);
-  const [isIngesting, setIsIngesting] = useState(false);
-  const [isBuildingIndex, setIsBuildingIndex] = useState(false);
-  const [isAnalyzing, setIsAnalyzing] = useState(false);
-  const [isFixingAndVerifying, setIsFixingAndVerifying] = useState(false);
-  const [appError, setAppError] = useState("");
+  const [contextError, setContextError] = useState("");
+  const [selectedWorkspace, setSelectedWorkspace] = useState<string>("");
 
-  const writeTerminal = useEffectEvent((chunk: string, stream: "stdout" | "stderr") => {
-    const terminal = terminalRef.current;
-    if (!terminal) {
-      return;
-    }
-    const colorizedChunk =
-      stream === "stderr" ? `\u001b[38;5;210m${chunk}\u001b[0m` : chunk;
-    terminal.write(colorizedChunk.replace(/\n/g, "\r\n"));
-  });
+  // Scan state
+  const [scanStage, setScanStage] = useState<ScanStage>("idle");
+  const [scanResult, setScanResult] = useState<FullScanResult | null>(null);
+  const [scanError, setScanError] = useState("");
 
-  const printSystemMessage = useEffectEvent((message: string) => {
-    const terminal = terminalRef.current;
-    if (!terminal) {
-      return;
-    }
-    terminal.writeln(`\u001b[38;5;81m${message}\u001b[0m`);
-  });
+  // Streaming state
+  const [streamingVulns, setStreamingVulns] = useState<SecurityVulnerability[]>([]);
+  const [currentFile, setCurrentFile] = useState("");
+  const [scannedCount, setScannedCount] = useState(0);
+  const [stageMessage, setStageMessage] = useState("");
 
+  // Fix tracking
+  const [fixedIds, setFixedIds] = useState<Set<string>>(new Set());
+  const [skippedIds, setSkippedIds] = useState<Set<string>>(new Set());
+  const [fixingId, setFixingId] = useState<string | null>(null);
+
+  // Expanded vulnerability
+  const [expandedId, setExpandedId] = useState<string | null>(null);
+
+  // Filters
+  const [severityFilter, setSeverityFilter] = useState<SeverityFilter>("All");
+  const [searchQuery, setSearchQuery] = useState("");
+
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const unlistenRefs = useRef<UnlistenFn[]>([]);
+
+  /* ── Load context on mount ─────────────────────────────────────── */
   useEffect(() => {
-    const terminal = new Terminal({
-      convertEol: true,
-      cursorBlink: true,
-      fontFamily: `"Iosevka Term", "JetBrains Mono", monospace`,
-      fontSize: 13,
-      theme: {
-        background: "#09111f",
-        foreground: "#d7e5ff",
-        cursor: "#f7c35f",
-        black: "#09111f",
-        red: "#ef8a85",
-        green: "#9dd39b",
-        yellow: "#f7c35f",
-        blue: "#72a0ff",
-        magenta: "#d9a6ff",
-        cyan: "#6ed6d3",
-        white: "#d7e5ff",
-        brightBlack: "#2a3f60",
-        brightRed: "#ff9f99",
-        brightGreen: "#b7e8b1",
-        brightYellow: "#ffd98b",
-        brightBlue: "#9db9ff",
-        brightMagenta: "#e2c1ff",
-        brightCyan: "#8de6e2",
-        brightWhite: "#f4f8ff",
-      },
-    });
-    const fitAddon = new FitAddon();
-    terminal.loadAddon(fitAddon);
-    terminalRef.current = terminal;
-    fitAddonRef.current = fitAddon;
-
-    if (terminalHostRef.current) {
-      terminal.open(terminalHostRef.current);
-      fitAddon.fit();
-      terminal.writeln("\u001b[1mAetherVerify console\u001b[0m");
-      terminal.writeln("Docker-executed commands stream here.");
-    }
-
-    const handleResize = () => fitAddon.fit();
-    window.addEventListener("resize", handleResize);
-
-    return () => {
-      window.removeEventListener("resize", handleResize);
-      terminal.dispose();
-    };
-  }, []);
-
-  useEffect(() => {
-    let cancelled = false;
-
-    const bootstrap = async () => {
-      try {
-        const context = await invoke<AppContext>("load_app_context");
-        if (cancelled) {
-          return;
-        }
+    invoke<AppContext>("load_app_context")
+      .then((context) => {
         setAppContext(context);
-        setWorkspaceRoot(context.workspaceRoot);
-        setSandboxImage(context.defaultContainerImage);
-        setSandboxMessage(context.dockerMessage);
-        setOllamaHost(context.defaultOllamaHost);
-        setEmbeddingModel(context.defaultEmbeddingModel);
-        setRerankerModel(context.defaultRerankerModel);
-        setLlmBaseUrl(context.defaultLlmBaseUrl);
-        setLlmModel(context.defaultLlmModel);
-        if (!hasPrintedBootstrapStatusRef.current) {
-          printSystemMessage(context.dockerMessage);
-          lastPrintedSystemMessageRef.current = context.dockerMessage;
-          hasPrintedBootstrapStatusRef.current = true;
-        }
-      } catch (error) {
-        if (cancelled) {
-          return;
-        }
-        setAppError(String(error));
-      } finally {
-        if (!cancelled) {
-          setIsLoadingContext(false);
-        }
+        setSelectedWorkspace(context.workspaceRoot);
+      })
+      .catch((e) => setContextError(String(e)));
+  }, []);
+
+  /* ── Change workspace ──────────────────────────────────────────── */
+  const handleBrowseWorkspace = useCallback(async () => {
+    try {
+      const selected = await open({
+        directory: true,
+        multiple: false,
+        title: "Select Workspace to Scan",
+      });
+      if (selected && typeof selected === "string") {
+        setSelectedWorkspace(selected);
       }
-    };
-
-    bootstrap();
-
-    return () => {
-      cancelled = true;
-    };
+    } catch (e) {
+      console.error("Error opening dialog", e);
+    }
   }, []);
 
-  useEffect(() => {
-    let unlistenOutput: (() => void) | undefined;
-    let unlistenStatus: (() => void) | undefined;
+  /* ── Setup streaming listeners ─────────────────────────────────── */
+  const setupStreamListeners = useCallback(async () => {
+    // Cleanup any existing listeners
+    for (const unlisten of unlistenRefs.current) {
+      unlisten();
+    }
+    unlistenRefs.current = [];
 
-    const attachListeners = async () => {
-      unlistenOutput = await listen<SandboxOutputEvent>("sandbox-output", (event) => {
-        if (!activeRunIdRef.current) {
-          activeRunIdRef.current = event.payload.runId;
-          setActiveRunId(event.payload.runId);
-        }
-        if (event.payload.runId !== activeRunIdRef.current) {
-          return;
-        }
-        writeTerminal(event.payload.chunk, event.payload.stream);
-      });
+    const u1 = await listen<ScanStagePayload>("scan-stage", (event) => {
+      const { stage, message } = event.payload;
+      setStageMessage(message);
+      if (stage === "scanning") setScanStage("scanning");
+      else if (stage === "analyzing") setScanStage("analyzing");
+      else if (stage === "complete") setScanStage("complete");
+      else if (stage === "llm-skipped") setScanStage("complete");
+    });
 
-      unlistenStatus = await listen<SandboxStatusEvent>("sandbox-status", (event) => {
-        if (!activeRunIdRef.current) {
-          activeRunIdRef.current = event.payload.runId;
-          setActiveRunId(event.payload.runId);
-        }
-        if (event.payload.runId !== activeRunIdRef.current) {
-          return;
-        }
-        setSandboxStage(event.payload.stage);
-        setSandboxMessage(event.payload.message);
-        if (event.payload.stage !== "pulling-image") {
-          const terminalMessage =
-            event.payload.exitCode != null
-              ? `${event.payload.message} Exit code: ${event.payload.exitCode}.`
-              : event.payload.message;
-          if (terminalMessage !== lastPrintedSystemMessageRef.current) {
-            printSystemMessage(terminalMessage);
-            lastPrintedSystemMessageRef.current = terminalMessage;
-          }
-        }
-        if (
-          event.payload.stage === "completed" ||
-          event.payload.stage === "failed"
-        ) {
-          setIsStartingSandbox(false);
-          setActiveRunId(null);
-          activeRunIdRef.current = null;
-          lastPrintedSystemMessageRef.current = "";
-        }
-      });
-    };
+    const u2 = await listen<ScanProgressPayload>("scan-progress", (event) => {
+      const { currentFile: file, scannedSoFar } = event.payload;
+      setCurrentFile(file);
+      setScannedCount(scannedSoFar);
+    });
 
-    attachListeners();
+    const u3 = await listen<SecurityVulnerability>("scan-vuln-found", (event) => {
+      setStreamingVulns((prev) => [...prev, event.payload]);
+    });
 
-    return () => {
-      unlistenOutput?.();
-      unlistenStatus?.();
-    };
+    unlistenRefs.current = [u1, u2, u3];
   }, []);
 
-  useEffect(() => {
-    fitAddonRef.current?.fit();
-  }, [ingestionSummary, indexSummary, analysisResponse, appContext]);
+  /* ── Full scan ─────────────────────────────────────────────────── */
+  const startScan = useCallback(async () => {
+    if (!appContext) return;
+    setScanStage("scanning");
+    setScanError("");
+    setScanResult(null);
+    setFixedIds(new Set());
+    setSkippedIds(new Set());
+    setExpandedId(null);
+    setStreamingVulns([]);
+    setCurrentFile("");
+    setScannedCount(0);
+    setStageMessage("Initializing scan…");
+    setSeverityFilter("All");
+    setSearchQuery("");
 
-  const runSandboxCommand = async () => {
-    setAppError("");
-    setIsStartingSandbox(true);
-    setSandboxStage("queued");
-    setSandboxMessage("Submitting command to the sandbox.");
-    lastPrintedSystemMessageRef.current = "";
-    terminalRef.current?.clear();
-    printSystemMessage(`Sandbox image: ${sandboxImage}`);
-    printSystemMessage(`Workspace copy source: ${workspaceRoot}`);
-    printSystemMessage(`Command: ${sandboxCommand}`);
+    await setupStreamListeners();
 
     try {
-      const handle = await invoke<SandboxRunHandle>("start_sandbox_command", {
-        request: {
-          workspaceRoot,
-          image: sandboxImage,
-          command: sandboxCommand,
-        },
+      const result = await invoke<FullScanResult>("full_security_scan", {
+        request: { workspaceRoot: selectedWorkspace || appContext.workspaceRoot },
       });
-      setActiveRunId(handle.runId);
-      activeRunIdRef.current = handle.runId;
-    } catch (error) {
-      setIsStartingSandbox(false);
-      setSandboxStage("failed");
-      setSandboxMessage(String(error));
-      setAppError(String(error));
-      printSystemMessage(`Failed to start sandbox command: ${String(error)}`);
-    }
-  };
-
-  const stopSandboxCommand = async () => {
-    if (!activeRunId) {
-      return;
+      setScanResult(result);
+      setScanStage("complete");
+      if (result.vulnerabilities.length > 0) {
+        // Auto-expand first critical, or first vuln
+        const firstCritical = result.vulnerabilities.find((v) => v.severity === "Critical");
+        setExpandedId(firstCritical?.id ?? result.vulnerabilities[0].id);
+      }
+    } catch (e) {
+      setScanError(String(e));
+      setScanStage("error");
     }
 
-    try {
-      await invoke("stop_sandbox_command", { runId: activeRunId });
-      setSandboxStage("cancelled");
-      setSandboxMessage("Sandbox command was stopped.");
-      setIsStartingSandbox(false);
-      setActiveRunId(null);
-      activeRunIdRef.current = null;
-      lastPrintedSystemMessageRef.current = "";
-      printSystemMessage("Sandbox container stopped.");
-    } catch (error) {
-      setAppError(String(error));
+    // Cleanup listeners
+    for (const unlisten of unlistenRefs.current) {
+      unlisten();
     }
-  };
+    unlistenRefs.current = [];
+  }, [appContext, selectedWorkspace, setupStreamListeners]);
 
-  const ingestWorkspace = async () => {
-    setAppError("");
-    setIsIngesting(true);
-    setIngestionSummary(null);
-
-    try {
-      const summary = await invoke<IngestionSummary>("ingest_workspace_graph", {
-        request: {
-          workspaceRoot,
-          neo4jUri,
-          neo4jUsername,
-          neo4jPassword,
-        },
-      });
-      setIngestionSummary(summary);
-    } catch (error) {
-      setAppError(String(error));
-    } finally {
-      setIsIngesting(false);
-    }
-  };
-
-  const buildContextIndex = async () => {
-    setAppError("");
-    setIsBuildingIndex(true);
-    setIndexSummary(null);
-
-    try {
-      const summary = await invoke<ContextIndexSummary>(
-        "build_workspace_context_index",
-        {
+  /* ── Apply fix ─────────────────────────────────────────────────── */
+  const applyFix = useCallback(
+    async (vuln: SecurityVulnerability) => {
+      if (!appContext || !scanResult) return;
+      setFixingId(vuln.id);
+      try {
+        const result = await invoke<FixResult>("apply_vulnerability_fix", {
           request: {
-            workspaceRoot,
-            ollamaHost,
-            embeddingModel,
-          },
-        },
-      );
-      setIndexSummary(summary);
-    } catch (error) {
-      setAppError(String(error));
-    } finally {
-      setIsBuildingIndex(false);
-    }
-  };
-
-  const analyzeWorkspaceIssue = async () => {
-    setAppError("");
-    setIsAnalyzing(true);
-    setAnalysisResponse(null);
-
-    try {
-      const response = await invoke<IssueAnalysisResponse>(
-        "analyze_workspace_issue",
-        {
-          request: {
-            workspaceRoot,
-            issue: issuePrompt,
-            ollamaHost,
-            embeddingModel,
-            rerankerModel,
-            llmBaseUrl,
-            llmApiKey,
-            llmModel,
-            retrievalLimit: 6,
-          },
-        },
-      );
-      setAnalysisResponse(response);
-    } catch (error) {
-      setAppError(String(error));
-    } finally {
-      setIsAnalyzing(false);
-    }
-  };
-
-  const fixAndVerifyIssue = async () => {
-    setAppError("");
-    setIsFixingAndVerifying(true);
-    setAnalysisResponse(null);
-    let activePrompt = issuePrompt;
-
-    try {
-      for (let attempt = 1; attempt <= 3; attempt++) {
-        printSystemMessage(`\n--- Autonomous Repair Attempt ${attempt} ---`);
-        printSystemMessage("Analyzing issue and waiting for LLM patch proposal...");
-
-        setIsAnalyzing(true);
-        const response = await invoke<IssueAnalysisResponse>(
-          "analyze_workspace_issue",
-          {
-            request: {
-              workspaceRoot,
-              issue: activePrompt,
-              ollamaHost,
-              embeddingModel,
-              rerankerModel,
-              llmBaseUrl,
-              llmApiKey,
-              llmModel,
-              retrievalLimit: 6,
-            },
-          },
-        );
-        setIsAnalyzing(false);
-        setAnalysisResponse(response);
-
-        if (!response.answer) {
-          printSystemMessage("LLM returned no answer. Aborting loop.");
-          break;
-        }
-
-        const match = response.answer.match(/```diff\n([\s\S]*?)\n```/);
-        const diff = match ? match[1] : null;
-
-        if (!diff) {
-          printSystemMessage("No unified diff block found in the LLM response. Aborting loop.");
-          break;
-        }
-
-        printSystemMessage("Extracted diff. Applying to workspace...");
-        const patchResult = await invoke<{ success: boolean; message: string }>("apply_patch_to_workspace", {
-          request: {
-            workspaceRoot,
-            patchContent: diff,
+            workspaceRoot: scanResult.workspaceRoot,
+            vulnerabilityId: vuln.id,
+            fixedCode: vuln.fixedCode,
+            file: vuln.file,
+            line: vuln.line,
+            endLine: vuln.endLine,
           },
         });
-
-        printSystemMessage(patchResult.message);
-        if (!patchResult.success) {
-          printSystemMessage("Failed to apply patch. Aborting loop.");
-          break;
-        }
-
-        if (!sandboxCommand.trim()) {
-          printSystemMessage("✅ No sandbox verification command configured. Assuming patch is successful!");
-          break;
-        }
-
-        printSystemMessage(`Verifying via sandbox command: ${sandboxCommand}`);
-        let verificationPassed = false;
-        let capturedConsoleOut = "";
-
-        await new Promise<void>((resolve, reject) => {
-          let stdoutUnlisten: (() => void) | undefined;
-          let statusUnlisten: (() => void) | undefined;
-
-          const cleanup = () => {
-            if (stdoutUnlisten) stdoutUnlisten();
-            if (statusUnlisten) statusUnlisten();
-          };
-
-          const setupListeners = async () => {
-            stdoutUnlisten = await listen<SandboxOutputEvent>("sandbox-output", (event) => {
-              capturedConsoleOut += event.payload.chunk;
-            });
-            statusUnlisten = await listen<SandboxStatusEvent>("sandbox-status", (event) => {
-              const stage = event.payload.stage;
-              if (stage === "completed") {
-                cleanup();
-                if (event.payload.exitCode === 0) {
-                  verificationPassed = true;
-                  resolve();
-                } else {
-                  resolve(); // Resolve to let the loop continue
-                }
-              } else if (stage === "failed" || stage === "cancelled") {
-                cleanup();
-                reject(event.payload.message);
-              }
-            });
-          };
-
-          setupListeners().then(() => {
-            invoke<SandboxRunHandle>("start_sandbox_command", {
-              request: {
-                workspaceRoot,
-                image: sandboxImage,
-                command: sandboxCommand,
-              },
-            }).catch((e) => {
-              cleanup();
-              reject(e);
-            });
-          });
-        });
-
-        if (verificationPassed) {
-          printSystemMessage("✅ Verification successful! Issue is resolved.");
-          break;
+        if (result.success) {
+          setFixedIds((prev) => new Set(prev).add(vuln.id));
         } else {
-          printSystemMessage("❌ Verification failed. Generating revised patch...");
-          activePrompt = `${issuePrompt}\n\nThe previously generated patch failed the verification hook. Below is the recent console output to guide your fix:\n\n${capturedConsoleOut.substring(capturedConsoleOut.length - 2000)}`;
+          setScanError(`Fix failed: ${result.message}`);
         }
+      } catch (e) {
+        setScanError(String(e));
+      } finally {
+        setFixingId(null);
       }
-    } catch (error) {
-      setAppError(String(error));
-      printSystemMessage(`Verification loop error: ${String(error)}`);
-    } finally {
-      setIsFixingAndVerifying(false);
-      setIsAnalyzing(false);
-    }
-  };
-
-  const phaseTwoStatus = isAnalyzing
-    ? "analyzing"
-    : isBuildingIndex
-      ? "indexing"
-      : "ready";
-  const phaseTwoWarnings = Array.from(
-    new Set([
-      ...(indexSummary?.warnings ?? []),
-      ...(analysisResponse?.warnings ?? []),
-    ]),
+    },
+    [appContext, scanResult]
   );
 
+  const skipVuln = useCallback((id: string) => {
+    setSkippedIds((prev) => new Set(prev).add(id));
+  }, []);
+
+  /* ── Computed values ───────────────────────────────────────────── */
+  const displayVulns = scanResult?.vulnerabilities ?? streamingVulns;
+  const filteredVulns = displayVulns.filter((v) => {
+    if (fixedIds.has(v.id) || skippedIds.has(v.id)) return true; // Still show but dimmed
+    if (severityFilter !== "All" && v.severity !== severityFilter) return false;
+    if (searchQuery) {
+      const q = searchQuery.toLowerCase();
+      return (
+        v.file.toLowerCase().includes(q) ||
+        v.vulnType.toLowerCase().includes(q) ||
+        v.title.toLowerCase().includes(q) ||
+        v.description.toLowerCase().includes(q) ||
+        v.owaspCategory.toLowerCase().includes(q)
+      );
+    }
+    return true;
+  });
+  const activeVulns = filteredVulns.filter(
+    (v) => !fixedIds.has(v.id) && !skippedIds.has(v.id)
+  );
+  const fixedCount = fixedIds.size;
+  const skippedCount = skippedIds.size;
+  const isScanning = scanStage === "scanning" || scanStage === "analyzing";
+
+  /* ── Loading ───────────────────────────────────────────────────── */
+  if (!appContext && !contextError) {
+    return (
+      <div className="app-shell">
+        <div className="loading-splash">
+          <div className="loading-spinner" />
+          <p>Initializing AetherVerify…</p>
+        </div>
+      </div>
+    );
+  }
+
+  /* ── Render ─────────────────────────────────────────────────────── */
   return (
-    <main className="app-shell">
-      <section className="hero-panel">
+    <div className="app-shell" ref={scrollRef}>
+      {/* ── Hero ─────────────────────────────────────────────────── */}
+      <header className="hero-panel">
         <div>
-          <p className="eyebrow">Phase 1 + Phase 2</p>
+          <p className="eyebrow">Security Scanner</p>
           <h1>AetherVerify</h1>
           <p className="hero-copy">
-            Desktop shell for safe code execution, repository graph ingestion,
-            local Ollama-based context retrieval, and issue analysis through an
-            OpenAI-compatible LLM endpoint.
+            Dynamic + static security analysis powered by AI.
+            One-click vulnerability detection, intelligent fix generation,
+            and diff-based code repair.
           </p>
         </div>
         <div className="hero-metrics">
           <div className="metric-card">
-            <span className="metric-label">Docker</span>
-            <strong>{appContext?.dockerAvailable ? "Connected" : "Unavailable"}</strong>
-            <p>{appContext?.dockerMessage ?? "Checking runtime..."}</p>
+            <strong>🐳 Docker</strong>
+            <p>
+              {appContext?.dockerAvailable
+                ? `✅ ${appContext.dockerMessage}`
+                : `❌ ${appContext?.dockerMessage ?? "Not connected"}`}
+            </p>
           </div>
           <div className="metric-card">
-            <span className="metric-label">Workspace</span>
-            <strong>{workspaceRoot || "Detecting..."}</strong>
-            <p>Use a single repository root, not a broad parent directory.</p>
-          </div>
-          <div className="metric-card">
-            <span className="metric-label">Ollama</span>
-            <strong>{embeddingModel}</strong>
-            <p>{ollamaHost || "Waiting for local model host"}</p>
-          </div>
-          <div className="metric-card">
-            <span className="metric-label">LLM</span>
-            <strong>{llmModel || "Configurable"}</strong>
+            <strong>🧠 LLM</strong>
             <p>
               {appContext?.llmApiKeyConfigured
-                ? "API key available from environment."
-                : "Provide a key in the UI or environment."}
+                ? `✅ ${appContext.defaultLlmModel || "Configured"}`
+                : "❌ Set GROQ_API_KEY in .env"}
             </p>
+          </div>
+          <div className="metric-card">
+            <strong>🔬 Embeddings</strong>
+            <p>{appContext?.defaultEmbeddingModel || "Not configured"}</p>
+          </div>
+        </div>
+      </header>
+
+      {contextError && <div className="app-error">⚠️ {contextError}</div>}
+
+      {/* ── Workspace Selector ────────────────────────────────────── */}
+      <section className="workspace-section">
+        <div className="workspace-row">
+          <label className="workspace-label">📁 Workspace</label>
+          <div className="workspace-input-group">
+            <input
+              type="text"
+              className="workspace-input"
+              value={selectedWorkspace}
+              onChange={(e) => setSelectedWorkspace(e.target.value)}
+              placeholder="Enter workspace path…"
+              disabled={isScanning}
+            />
+            <button
+              className="workspace-browse-btn"
+              onClick={handleBrowseWorkspace}
+              disabled={isScanning}
+            >
+              Browse
+            </button>
           </div>
         </div>
       </section>
 
-      {appError ? <p className="app-error">{appError}</p> : null}
-
-      <section className="workspace-grid">
-        <article className="panel">
-          <div className="panel-header">
-            <div>
-              <p className="panel-label">Secure Terminal</p>
-              <h2>Sandboxed command runner</h2>
-            </div>
-            <span className={`status-badge status-${sandboxStage}`}>
-              {sandboxStage}
-            </span>
-          </div>
-
-          <div className="form-grid">
-            <label>
-              Workspace root
-              <input
-                value={workspaceRoot}
-                onChange={(event) => setWorkspaceRoot(event.currentTarget.value)}
-                placeholder="/path/to/repository"
-              />
-            </label>
-            <label>
-              Docker image
-              <input
-                value={sandboxImage}
-                onChange={(event) => setSandboxImage(event.currentTarget.value)}
-                placeholder="node:22-bookworm"
-              />
-            </label>
-          </div>
-
-          <label className="command-field">
-            Sandbox command
-            <textarea
-              value={sandboxCommand}
-              onChange={(event) => setSandboxCommand(event.currentTarget.value)}
-              rows={3}
-            />
-          </label>
-
-          <div className="action-row">
-            <button
-              type="button"
-              className="primary-button"
-              onClick={runSandboxCommand}
-              disabled={isLoadingContext || isStartingSandbox}
-            >
-              {isStartingSandbox ? "Running..." : "Run in Docker"}
-            </button>
-            <button
-              type="button"
-              className="secondary-button"
-              onClick={stopSandboxCommand}
-              disabled={!activeRunId}
-            >
-              Stop run
-            </button>
-            <p className="status-copy">{sandboxMessage}</p>
-          </div>
-
-          <div className="terminal-card">
-            <div ref={terminalHostRef} className="terminal-host" />
-          </div>
-        </article>
-
-        <article className="panel">
-          <div className="panel-header">
-            <div>
-              <p className="panel-label">Repository Ingestion</p>
-              <h2>Tree-sitter to Neo4j graph</h2>
-            </div>
-            <span className="status-badge status-ingestion">
-              {isIngesting ? "ingesting" : "ready"}
-            </span>
-          </div>
-
-          <p className="panel-copy">
-            Parses JavaScript, TypeScript, TSX, Python, and Rust files. It
-            extracts functions, methods, classes, call edges, and inheritance
-            edges, then persists the graph to Neo4j if credentials are
-            available.
-          </p>
-          <p className="panel-copy">
-            Use a single repository root here. Avoid pointing this at a broad
-            parent folder like your whole home or development directory.
-          </p>
-
-          <div className="form-grid neo4j-grid">
-            <label>
-              Neo4j URI
-              <input
-                value={neo4jUri}
-                onChange={(event) => setNeo4jUri(event.currentTarget.value)}
-                placeholder="bolt://127.0.0.1:7687"
-              />
-            </label>
-            <label>
-              Neo4j username
-              <input
-                value={neo4jUsername}
-                onChange={(event) => setNeo4jUsername(event.currentTarget.value)}
-                placeholder="neo4j"
-              />
-            </label>
-            <label>
-              Neo4j password
-              <input
-                type="password"
-                value={neo4jPassword}
-                onChange={(event) => setNeo4jPassword(event.currentTarget.value)}
-                placeholder="Optional if set in env"
-              />
-            </label>
-          </div>
-
-          <div className="action-row">
-            <button
-              type="button"
-              className="primary-button"
-              onClick={ingestWorkspace}
-              disabled={isLoadingContext || isIngesting}
-            >
-              {isIngesting ? "Ingesting..." : "Build repository graph"}
-            </button>
-            <p className="status-copy">
-              {ingestionSummary?.neo4jStatus ??
-                "Graph results will appear here after an ingest run."}
-            </p>
-          </div>
-
-          <div className="summary-grid">
-            <div className="summary-card">
-              <span>Scanned files</span>
-              <strong>{ingestionSummary?.scannedFiles ?? "0"}</strong>
-            </div>
-            <div className="summary-card">
-              <span>Symbols</span>
-              <strong>{ingestionSummary?.symbolCount ?? "0"}</strong>
-            </div>
-            <div className="summary-card">
-              <span>Call edges</span>
-              <strong>{ingestionSummary?.callEdgeCount ?? "0"}</strong>
-            </div>
-            <div className="summary-card">
-              <span>Inheritance edges</span>
-              <strong>{ingestionSummary?.inheritanceEdgeCount ?? "0"}</strong>
-            </div>
-          </div>
-
-          <div className="symbol-list">
-            <div className="symbol-list-header">
-              <h3>Detected symbols</h3>
-              <span>{ingestionSummary?.storedToNeo4j ? "Persisted" : "Preview"}</span>
-            </div>
-            <ul>
-              {ingestionSummary?.symbolPreview.length ? (
-                ingestionSummary.symbolPreview.map((symbol) => (
-                  <li key={`${symbol.filePath}:${symbol.line}:${symbol.name}`}>
-                    <div>
-                      <strong>{symbol.name}</strong>
-                      <span>
-                        {symbol.kind} · {symbol.language}
-                      </span>
-                    </div>
-                    <code>
-                      {symbol.filePath}:{symbol.line}
-                    </code>
-                  </li>
-                ))
-              ) : (
-                <li className="empty-state">No graph data generated yet.</li>
-              )}
-            </ul>
-          </div>
-
-          {ingestionSummary?.warnings.length ? (
-            <div className="warning-card">
-              <h3>Warnings</h3>
-              <ul>
-                {ingestionSummary.warnings.map((warning) => (
-                  <li key={warning}>{warning}</li>
-                ))}
-              </ul>
-            </div>
-          ) : null}
-        </article>
-      </section>
-
-      <section className="phase-grid">
-        <article className="panel phase-panel">
-          <div className="panel-header">
-            <div>
-              <p className="panel-label">Phase 2</p>
-              <h2>Hybrid retrieval and issue analysis</h2>
-            </div>
-            <span className={`status-badge status-${phaseTwoStatus}`}>
-              {phaseTwoStatus}
-            </span>
-          </div>
-
-          <p className="panel-copy">
-            Build a cached context index with Ollama embeddings, rerank the most
-            relevant chunks locally, then send the compact prompt to an
-            OpenAI-compatible endpoint such as Groq.
-          </p>
-
-          <div className="form-grid model-grid">
-            <label>
-              Ollama host
-              <input
-                value={ollamaHost}
-                onChange={(event) => setOllamaHost(event.currentTarget.value)}
-                placeholder="http://127.0.0.1:11434"
-              />
-            </label>
-            <label>
-              Embedding model
-              <input
-                value={embeddingModel}
-                onChange={(event) => setEmbeddingModel(event.currentTarget.value)}
-                placeholder="snowflake-arctic-embed2:latest"
-              />
-            </label>
-            <label>
-              Reranker model
-              <input
-                value={rerankerModel}
-                onChange={(event) => setRerankerModel(event.currentTarget.value)}
-                placeholder="qllama/bge-reranker-v2-m3:f16"
-              />
-            </label>
-            <label>
-              LLM base URL
-              <input
-                value={llmBaseUrl}
-                onChange={(event) => setLlmBaseUrl(event.currentTarget.value)}
-                placeholder="https://api.x.ai/v1"
-              />
-            </label>
-            <label>
-              LLM model
-              <input
-                value={llmModel}
-                onChange={(event) => setLlmModel(event.currentTarget.value)}
-                placeholder="Enter your Groq model ID (e.g. qwen/qwen3-32b)"
-              />
-            </label>
-            <label>
-              LLM API key
-              <input
-                type="password"
-                value={llmApiKey}
-                onChange={(event) => setLlmApiKey(event.currentTarget.value)}
-                placeholder={
-                  appContext?.llmApiKeyConfigured
-                    ? "Optional if set in env"
-                    : "Paste key or use env"
-                }
-              />
-            </label>
-          </div>
-
-          <label className="command-field">
-            Issue prompt
-            <textarea
-              value={issuePrompt}
-              onChange={(event) => setIssuePrompt(event.currentTarget.value)}
-              rows={5}
-            />
-          </label>
-
-          <div className="action-row">
-            <button
-              type="button"
-              className="primary-button"
-              onClick={buildContextIndex}
-              disabled={isLoadingContext || isBuildingIndex || isAnalyzing}
-            >
-              {isBuildingIndex ? "Indexing..." : "Build context index"}
-            </button>
-            <button
-              type="button"
-              className="secondary-button"
-              onClick={analyzeWorkspaceIssue}
-              disabled={isLoadingContext || isBuildingIndex || isAnalyzing || isFixingAndVerifying}
-            >
-              {isAnalyzing && !isFixingAndVerifying ? "Analyzing..." : "Analyze issue"}
-            </button>
-            <button
-              type="button"
-              className="primary-button"
-              onClick={fixAndVerifyIssue}
-              disabled={isLoadingContext || isBuildingIndex || isAnalyzing || isFixingAndVerifying}
-              style={{ background: "linear-gradient(135deg, #72a0ff 0%, #d9a6ff 100%)", color: "#09111f", border: "none" }}
-            >
-              {isFixingAndVerifying ? "Autonomous loop..." : "Fix & Verify (Auto)"}
-            </button>
-            <div className="status-stack">
-              <p className="status-copy">
-                {analysisResponse?.indexStatus ??
-                  indexSummary?.indexPath ??
-                  "Context index is cached in .aetherverify/context-index.json."}
-              </p>
-              <p className="status-copy">
-                {analysisResponse?.llmStatus ??
-                  "If the LLM is not configured, retrieval still works and the answer section stays empty."}
-              </p>
-            </div>
-          </div>
-
-          <div className="summary-grid phase-summary-grid">
-            <div className="summary-card">
-              <span>Indexed files</span>
-              <strong>{indexSummary?.indexedFiles ?? "0"}</strong>
-            </div>
-            <div className="summary-card">
-              <span>Chunks</span>
-              <strong>{indexSummary?.chunkCount ?? "0"}</strong>
-            </div>
-            <div className="summary-card">
-              <span>Indexed source</span>
-              <strong>
-                {indexSummary ? formatMegabytes(indexSummary.totalSourceBytes) : "0.0 MB"}
-              </strong>
-            </div>
-            <div className="summary-card">
-              <span>Retrieved context</span>
-              <strong>{analysisResponse?.retrievedContext.length ?? "0"}</strong>
-            </div>
-          </div>
-
-          <div className="phase-two-grid">
-            <div className="symbol-list context-list">
-              <div className="symbol-list-header">
-                <h3>Retrieved context</h3>
-                <span>{analysisResponse ? "Ranked" : "Waiting"}</span>
+      {/* ── Scan Controls ────────────────────────────────────────── */}
+      <section className="scan-section">
+        <div className="scan-header">
+          <div className="scan-title-row">
+            <h2>🛡️ Security Analysis</h2>
+            {scanStage !== "idle" && scanStage !== "error" && (
+              <div className="pipeline-stepper">
+                <span className={`step ${scanStage === "scanning" || scanStage === "analyzing" || scanStage === "complete" ? "step-done" : ""}`}>
+                  ① Scan
+                </span>
+                <span className="step-arrow">→</span>
+                <span className={`step ${scanStage === "analyzing" || scanStage === "complete" ? "step-done" : ""}`}>
+                  ② AI Analysis
+                </span>
+                <span className="step-arrow">→</span>
+                <span className={`step ${scanStage === "complete" ? "step-done" : ""}`}>
+                  ③ Results
+                </span>
               </div>
-              <ul>
-                {analysisResponse?.retrievedContext.length ? (
-                  analysisResponse.retrievedContext.map((context) => (
-                    <li
-                      key={`${context.filePath}:${context.startLine}:${context.endLine}`}
+            )}
+          </div>
+
+          <button
+            className="scan-button"
+            onClick={startScan}
+            disabled={isScanning || !appContext || !selectedWorkspace}
+          >
+            {isScanning ? (
+              <>
+                <span className="scan-spinner" />
+                {scanStage === "scanning" ? "Scanning…" : "AI Analyzing…"}
+              </>
+            ) : (
+              "🛡️ Scan & Secure"
+            )}
+          </button>
+        </div>
+
+        {/* ── Live Progress ────────────────────────────────────────── */}
+        {isScanning && (
+          <div className="live-progress">
+            <div className="live-progress-header">
+              <span className="live-pulse" />
+              <span className="live-stage-msg">{stageMessage}</span>
+            </div>
+            {scanStage === "scanning" && (
+              <div className="live-details">
+                <span className="live-file-count">{scannedCount} files scanned</span>
+                <span className="live-vuln-count">{streamingVulns.length} vulnerabilities found</span>
+              </div>
+            )}
+            {currentFile && scanStage === "scanning" && (
+              <div className="live-current-file">
+                <code>{currentFile}</code>
+              </div>
+            )}
+            <div className="live-progress-bar">
+              <div className="live-progress-fill live-progress-animated" />
+            </div>
+          </div>
+        )}
+
+        {scanError && <div className="app-error">⚠️ {scanError}</div>}
+
+        {/* ── Results ──────────────────────────────────────────── */}
+        {(scanResult || (streamingVulns.length > 0 && scanStage === "complete")) && (
+          <>
+            {/* Summary bar */}
+            <div className="results-summary">
+              <div className="summary-grid">
+                <div className="summary-card">
+                  <span>Files Scanned</span>
+                  <strong>{scanResult?.scannedFiles ?? scannedCount}</strong>
+                </div>
+                <div className="summary-card">
+                  <span>Total Found</span>
+                  <strong>{scanResult?.totalVulnerabilities ?? streamingVulns.length}</strong>
+                </div>
+                <div className="summary-card" style={{ borderColor: "rgba(255,71,87,0.3)" }}>
+                  <span>Critical</span>
+                  <strong style={{ color: "#ff4757" }}>{scanResult?.criticalCount ?? streamingVulns.filter(v => v.severity === "Critical").length}</strong>
+                </div>
+                <div className="summary-card" style={{ borderColor: "rgba(255,165,2,0.3)" }}>
+                  <span>High</span>
+                  <strong style={{ color: "#ffa502" }}>{scanResult?.highCount ?? streamingVulns.filter(v => v.severity === "High").length}</strong>
+                </div>
+                <div className="summary-card" style={{ borderColor: "rgba(247,195,95,0.3)" }}>
+                  <span>Medium</span>
+                  <strong style={{ color: "#f7c35f" }}>{scanResult?.mediumCount ?? streamingVulns.filter(v => v.severity === "Medium").length}</strong>
+                </div>
+                <div className="summary-card" style={{ borderColor: "rgba(114,160,255,0.3)" }}>
+                  <span>Low</span>
+                  <strong style={{ color: "#72a0ff" }}>{scanResult?.lowCount ?? streamingVulns.filter(v => v.severity === "Low").length}</strong>
+                </div>
+              </div>
+
+              {fixedCount + skippedCount > 0 && (
+                <div className="fix-progress-bar">
+                  <div className="fix-progress-label">
+                    ✅ {fixedCount} fixed · ⏭️ {skippedCount} skipped · 📋 {activeVulns.length} remaining
+                  </div>
+                  <div className="fix-progress-track">
+                    <div
+                      className="fix-progress-fill fix-progress-fixed"
+                      style={{ width: `${(fixedCount / (scanResult?.totalVulnerabilities ?? displayVulns.length)) * 100}%` }}
+                    />
+                    <div
+                      className="fix-progress-fill fix-progress-skipped"
+                      style={{ width: `${(skippedCount / (scanResult?.totalVulnerabilities ?? displayVulns.length)) * 100}%` }}
+                    />
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* Severity filter + search */}
+            {displayVulns.length > 0 && (
+              <div className="filter-bar">
+                <div className="severity-filters">
+                  {(["All", "Critical", "High", "Medium", "Low"] as SeverityFilter[]).map((sev) => (
+                    <button
+                      key={sev}
+                      className={`filter-pill ${severityFilter === sev ? "filter-active" : ""}`}
+                      style={sev !== "All" ? { "--pill-color": severityColor[sev] } as React.CSSProperties : undefined}
+                      onClick={() => setSeverityFilter(sev)}
                     >
-                      <div>
-                        <strong>{context.filePath}</strong>
-                        <span>
-                          {context.language} · lines {context.startLine}-{context.endLine}
+                      {sev}
+                      {sev !== "All" && (
+                        <span className="filter-count">
+                          {displayVulns.filter((v) => v.severity === sev).length}
                         </span>
-                        <p className="context-snippet">{context.snippet}</p>
-                      </div>
-                      <code>
-                        score {context.score}
-                        <br />
-                        vec {context.vectorScore}
-                        <br />
-                        lex {context.lexicalScore}
-                        {context.rerankScore != null ? (
-                          <>
-                            <br />
-                            rr {context.rerankScore}
-                          </>
-                        ) : null}
-                      </code>
-                    </li>
-                  ))
-                ) : (
-                  <li className="empty-state">
-                    Build an index and analyze an issue to see ranked repository
-                    chunks here.
-                  </li>
-                )}
-              </ul>
-            </div>
-
-            <div className="answer-card">
-              <div className="symbol-list-header">
-                <h3>Model analysis</h3>
-                <span>{analysisResponse?.llmModel || "Optional"}</span>
+                      )}
+                    </button>
+                  ))}
+                </div>
+                <input
+                  type="text"
+                  className="search-input"
+                  placeholder="🔍 Search by file, type, description…"
+                  value={searchQuery}
+                  onChange={(e) => setSearchQuery(e.target.value)}
+                />
               </div>
-              {analysisResponse?.answer ? (
-                <pre>{analysisResponse.answer}</pre>
-              ) : (
-                <p className="empty-state">
-                  No model answer yet. Retrieval still works even when the LLM
-                  key or model is missing.
-                </p>
-              )}
+            )}
 
-              <div className="prompt-card">
-                <h3>Prompt preview</h3>
-                <pre>{analysisResponse?.promptPreview ?? "Prompt preview appears here after analysis."}</pre>
-              </div>
-            </div>
-          </div>
-
-          {phaseTwoWarnings.length ? (
-            <div className="warning-card">
-              <h3>Phase 2 warnings</h3>
-              <ul>
-                {phaseTwoWarnings.map((warning) => (
-                  <li key={warning}>{warning}</li>
+            {/* Pipeline log */}
+            {scanResult && scanResult.pipelineLog.length > 0 && (
+              <div className="pipeline-log">
+                {scanResult.pipelineLog.map((step, i) => (
+                  <div key={i} className="pipeline-step">
+                    <span className="pipeline-stage">{step.stage}</span>
+                    <span className="pipeline-msg">{step.message}</span>
+                    <span className="pipeline-time">{step.durationMs}ms</span>
+                  </div>
                 ))}
-              </ul>
-            </div>
-          ) : null}
-        </article>
+              </div>
+            )}
+
+            {/* No vulns */}
+            {scanResult && scanResult.totalVulnerabilities === 0 && (
+              <div className="clean-result">
+                <h3>✅ No Vulnerabilities Found</h3>
+                <p>Your project passed all {scanResult.scannedFiles} file security checks.</p>
+              </div>
+            )}
+
+            {/* Vulnerability list */}
+            {filteredVulns.length > 0 && (
+              <div className="vuln-list">
+                {filteredVulns.map((vuln) => {
+                  const isFixed = fixedIds.has(vuln.id);
+                  const isSkipped = skippedIds.has(vuln.id);
+                  const isExpanded = expandedId === vuln.id;
+                  const isFixing = fixingId === vuln.id;
+
+                  return (
+                    <div
+                      key={vuln.id}
+                      className={`vuln-card ${isFixed ? "vuln-fixed" : ""} ${isSkipped ? "vuln-skipped" : ""}`}
+                      style={{ borderLeftColor: severityBorder[vuln.severity] ?? "#72a0ff" }}
+                    >
+                      {/* Header row */}
+                      <div
+                        className="vuln-header"
+                        onClick={() => setExpandedId(isExpanded ? null : vuln.id)}
+                      >
+                        <div className="vuln-header-left">
+                          <span
+                            className="vuln-severity"
+                            style={{ color: severityColor[vuln.severity] }}
+                          >
+                            {vuln.severity}
+                          </span>
+                          <span className="vuln-type-badge">{vuln.vulnType}</span>
+                          <span className="vuln-owasp">{vuln.owaspCategory}</span>
+                        </div>
+                        <div className="vuln-header-right">
+                          {isFixed && <span className="vuln-status-badge fixed">✅ Fixed</span>}
+                          {isSkipped && <span className="vuln-status-badge skipped">⏭️ Skipped</span>}
+                          <span className="vuln-confidence">
+                            {Math.round(vuln.confidence * 100)}% conf
+                          </span>
+                          <span className="vuln-expand">{isExpanded ? "▼" : "▶"}</span>
+                        </div>
+                      </div>
+
+                      {/* Title + location */}
+                      <div className="vuln-title">{vuln.title}</div>
+                      <div className="vuln-location">
+                        <code>{vuln.file}:{vuln.line}</code>
+                        <span className="vuln-layer">{vuln.detectionLayer}</span>
+                      </div>
+
+                      {/* Expanded content */}
+                      {isExpanded && (
+                        <div className="vuln-details">
+                          <p className="vuln-description">{vuln.description}</p>
+
+                          {vuln.aiExplanation && (
+                            <div className="ai-explanation">
+                              <strong>🧠 AI Analysis:</strong>
+                              <p>{vuln.aiExplanation}</p>
+                            </div>
+                          )}
+
+                          {/* Diff viewer */}
+                          <div className="diff-viewer">
+                            <div className="diff-panel diff-original">
+                              <div className="diff-header">❌ Vulnerable Code</div>
+                              <pre>{vuln.originalCode}</pre>
+                            </div>
+                            <div className="diff-panel diff-fixed">
+                              <div className="diff-header">✅ Fixed Code</div>
+                              <pre>{vuln.fixedCode}</pre>
+                            </div>
+                          </div>
+
+                          {/* Actions */}
+                          {!isFixed && !isSkipped && (
+                            <div className="vuln-actions">
+                              <button
+                                className="fix-btn fix-accept"
+                                onClick={(e) => { e.stopPropagation(); applyFix(vuln); }}
+                                disabled={isFixing}
+                              >
+                                {isFixing ? "Applying…" : "✅ Accept & Fix"}
+                              </button>
+                              <button
+                                className="fix-btn fix-skip"
+                                onClick={(e) => { e.stopPropagation(); skipVuln(vuln.id); }}
+                              >
+                                ⏭️ Skip
+                              </button>
+                            </div>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+
+            {/* Warnings */}
+            {scanResult && scanResult.warnings.length > 0 && (
+              <div className="warning-card">
+                <h3>⚠️ Warnings</h3>
+                <ul>
+                  {scanResult.warnings.map((w, i) => (
+                    <li key={i}>{w}</li>
+                  ))}
+                </ul>
+              </div>
+            )}
+          </>
+        )}
       </section>
-    </main>
+    </div>
   );
 }
 

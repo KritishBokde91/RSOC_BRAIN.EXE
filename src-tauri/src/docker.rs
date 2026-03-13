@@ -83,6 +83,9 @@ pub async fn load_app_context() -> Result<AppContext, String> {
         && std::env::var("NEO4J_USERNAME").is_ok()
         && std::env::var("NEO4J_PASSWORD").is_ok();
 
+    let container_image = std::env::var("AETHERVERIFY_CONTAINER_IMAGE")
+        .unwrap_or_else(|_| DEFAULT_CONTAINER_IMAGE.to_string());
+
     let (docker_available, docker_message) = match connect_docker().await {
         Ok((_, message)) => (true, message),
         Err(message) => (false, message),
@@ -90,7 +93,7 @@ pub async fn load_app_context() -> Result<AppContext, String> {
 
     Ok(AppContext {
         workspace_root: workspace_root.display().to_string(),
-        default_container_image: DEFAULT_CONTAINER_IMAGE.to_string(),
+        default_container_image: container_image,
         docker_available,
         docker_message,
         neo4j_env_configured,

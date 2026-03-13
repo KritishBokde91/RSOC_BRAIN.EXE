@@ -355,7 +355,7 @@ pub async fn analyze_issue(request: IssueAnalysisRequest) -> Result<IssueAnalysi
     }
 
     candidates.sort_by(|left, right| right.score.total_cmp(&left.score));
-	// Context Expansion Flow: Merge snippet content with neighbor chunks
+    // Context Expansion Flow: Merge snippet content with neighbor chunks
     let retrieved_context = candidates
         .into_iter()
         .take(retrieval_limit)
@@ -363,10 +363,12 @@ pub async fn analyze_issue(request: IssueAnalysisRequest) -> Result<IssueAnalysi
             let mut expanded_content = candidate.chunk.content.clone();
             let mut expanded_start = candidate.chunk.start_line;
             let mut expanded_end = candidate.chunk.end_line;
-            
+
             // Try expanding once up
             if let Some(prev_chunk) = index.chunks.iter().find(|c| {
-                c.file_path == candidate.chunk.file_path && c.end_line >= expanded_start.saturating_sub(MAX_CHUNK_LINES) && c.end_line <= expanded_start
+                c.file_path == candidate.chunk.file_path
+                    && c.end_line >= expanded_start.saturating_sub(MAX_CHUNK_LINES)
+                    && c.end_line <= expanded_start
             }) {
                 if prev_chunk.start_line < expanded_start {
                     expanded_content = format!("{}\n{}", prev_chunk.content, expanded_content);
@@ -376,7 +378,9 @@ pub async fn analyze_issue(request: IssueAnalysisRequest) -> Result<IssueAnalysi
 
             // Try expanding once down
             if let Some(next_chunk) = index.chunks.iter().find(|c| {
-                c.file_path == candidate.chunk.file_path && c.start_line <= expanded_end + MAX_CHUNK_LINES && c.start_line >= expanded_end
+                c.file_path == candidate.chunk.file_path
+                    && c.start_line <= expanded_end + MAX_CHUNK_LINES
+                    && c.start_line >= expanded_end
             }) {
                 if next_chunk.end_line > expanded_end {
                     expanded_content = format!("{}\n{}", expanded_content, next_chunk.content);
@@ -559,7 +563,10 @@ async fn load_or_build_index(
                     let full_path = workspace_root.join(path_str);
                     if let Ok(metadata) = std::fs::metadata(&full_path) {
                         if let Ok(modified) = metadata.modified() {
-                            let modified_unix = modified.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+                            let modified_unix = modified
+                                .duration_since(UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs();
                             if modified_unix > index.built_at_unix {
                                 is_stale = true;
                                 break;
@@ -1005,16 +1012,60 @@ async fn rerank_candidates(
 
 async fn generate_issue_analysis(llm: &ResolvedLlmConfig, prompt: &str) -> Result<String, String> {
     let client = http_client()?;
+    let system_prompt = r#"You are AetherVerify, a world-class autonomous bug detection and repair engine that combines static analysis evidence with deep semantic code understanding. You are more accurate than GitHub Copilot, Claude Code, and GPT-4 Codex because you receive deterministic static analysis evidence alongside retrieved code context.
+
+IMPORTANT RULES:
+1. If static analysis evidence is provided (marked [STATIC EVIDENCE]), treat it as GROUND TRUTH — the pattern was deterministically detected.
+2. Verify the static finding by cross-referencing with the retrieved code context.
+3. Your fix must be MINIMAL — change only what is necessary.
+4. Never introduce new bugs in your fix.
+
+Your response MUST follow this EXACT structure:
+
+## Bug Classification
+- BugType: [one of: LogicError | NullDereference | DivideByZero | OffByOne | RaceCondition | MemoryLeak | SecurityVuln | TypeMismatch | UnreachableCode | SilentExceptionSwallow | HardcodedSecret | PanicRisk | Other]
+- Confidence: [0-100]%
+- Severity: [Critical | High | Medium | Low]
+
+## Root Cause Analysis
+Provide step-by-step chain-of-thought reasoning about WHY this bug exists. Reference specific lines and functions.
+
+## Affected Symbols
+List each function/class/variable involved with file path + line number.
+
+## Reproduction Scenario
+Describe how to trigger this bug deterministically (e.g., specific inputs, test commands).
+
+## Verified Fix
+Explain what the fix does and why it is correct. Then provide a MINIMAL unified diff:
+
+```diff
+--- a/path/to/file
++++ b/path/to/file
+@@ -line,count +line,count @@
+ context line
+-old buggy line
++new fixed line
+ context line
+```
+
+## Validation Steps
+How to verify the fix works (e.g., test commands, expected output)."#;
+
     let response = client
-        .post(format!("{}/chat/completions", llm.base_url.trim_end_matches('/')))
+        .post(format!(
+            "{}/chat/completions",
+            llm.base_url.trim_end_matches('/')
+        ))
         .bearer_auth(&llm.api_key)
         .json(&serde_json::json!({
             "model": llm.model,
-            "temperature": 0.2,
+            "temperature": 0.15,
+            "max_tokens": 4096,
             "messages": [
                 {
                     "role": "system",
-                    "content": "You are AetherVerify Phase 2. Diagnose likely root causes from the supplied repository context. Be explicit when the context is insufficient. Structure the answer as Diagnosis, Likely Files, Validation Steps, and a Patch Plan. The Patch Plan MUST contain a properly formatted Unified Diff block ready to be applied (wrapped in ```diff...```)."
+                    "content": system_prompt
                 },
                 {
                     "role": "user",
@@ -1049,10 +1100,39 @@ async fn generate_issue_analysis(llm: &ResolvedLlmConfig, prompt: &str) -> Resul
 }
 
 fn build_issue_prompt(issue: &str, retrieved_context: &[RetrievedContext]) -> String {
+    build_issue_prompt_with_static(issue, retrieved_context, &[])
+}
+
+pub fn build_issue_prompt_with_static(
+    issue: &str,
+    retrieved_context: &[RetrievedContext],
+    static_bugs: &[crate::static_analysis::StaticBugReport],
+) -> String {
     let mut prompt = String::new();
-    prompt.push_str("Issue:\n");
+    prompt.push_str("## Issue Description\n");
     prompt.push_str(issue.trim());
-    prompt.push_str("\n\nRetrieved repository context:\n");
+    prompt.push_str("\n");
+
+    // Inject static analysis evidence if available
+    if !static_bugs.is_empty() {
+        prompt.push_str("\n## [STATIC EVIDENCE] Deterministic Bug Findings\n");
+        prompt.push_str("The following bugs were detected by static analysis (ground truth — these patterns exist in the code):\n\n");
+        for (index, bug) in static_bugs.iter().enumerate() {
+            prompt.push_str(&format!(
+                "[Static Bug {}] {} (line {}) | Severity: {} | Type: {}\n",
+                index + 1,
+                bug.file,
+                bug.line,
+                bug.severity,
+                bug.bug_type
+            ));
+            prompt.push_str(&format!("  Description: {}\n", bug.description));
+            prompt.push_str(&format!("  Evidence: `{}`\n", bug.evidence_snippet));
+            prompt.push_str(&format!("  Hint: {}\n\n", bug.suggested_fix_hint));
+        }
+    }
+
+    prompt.push_str("\n## Retrieved Repository Context\n");
 
     for (index, context) in retrieved_context.iter().enumerate() {
         prompt.push_str(&format!(
@@ -1076,7 +1156,7 @@ fn build_issue_prompt(issue: &str, retrieved_context: &[RetrievedContext]) -> St
     }
 
     prompt.push_str(
-        "\nReturn the most likely diagnosis, the files or regions to edit, what should be tested next, and a concrete patch plan containing a Unified Diff of the proposed changes.",
+        "\nAnalyze the issue using the static evidence and code context above. Follow the exact response structure specified in your instructions.",
     );
 
     prompt

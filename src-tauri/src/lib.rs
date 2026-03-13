@@ -2,6 +2,9 @@ mod docker;
 mod ingestion;
 mod intelligence;
 mod patch;
+mod pipeline;
+mod security_scanner;
+mod static_analysis;
 mod workspace;
 
 use std::{
@@ -19,6 +22,10 @@ use intelligence::{
     IssueAnalysisRequest, IssueAnalysisResponse,
 };
 use patch::{apply_unified_diff, ApplyPatchRequest, ApplyPatchResponse};
+use pipeline::{FixRequest, FixResult, FullScanRequest, FullScanResult};
+use static_analysis::{
+    detect_static_bugs as run_static_analysis, StaticAnalysisRequest, StaticAnalysisSummary,
+};
 use tauri::State;
 
 #[derive(Clone, Default)]
@@ -81,7 +88,36 @@ async fn apply_patch_to_workspace(
     }
 }
 
+#[tauri::command]
+async fn detect_static_bugs(
+    request: StaticAnalysisRequest,
+) -> Result<StaticAnalysisSummary, String> {
+    run_static_analysis(request).await
+}
+
+#[tauri::command]
+async fn full_security_scan(
+    app: tauri::AppHandle,
+    request: FullScanRequest,
+) -> Result<FullScanResult, String> {
+    pipeline::run_full_scan(app, request).await
+}
+
+#[tauri::command]
+async fn apply_vulnerability_fix(request: FixRequest) -> Result<FixResult, String> {
+    pipeline::apply_fix(request).await
+}
+
 fn default_workspace_root() -> Result<PathBuf, String> {
+    // 1. Check env var first
+    if let Ok(env_root) = std::env::var("AETHERVERIFY_WORKSPACE_ROOT") {
+        let path = PathBuf::from(env_root.trim());
+        if path.exists() {
+            return Ok(path);
+        }
+    }
+
+    // 2. Fallback: CWD-based detection
     let current_dir = std::env::current_dir().map_err(|error| error.to_string())?;
     if current_dir
         .file_name()
@@ -102,6 +138,7 @@ pub fn run() {
     tauri::Builder::default()
         .manage(AppState::default())
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             load_app_context,
             start_sandbox_command,
@@ -109,7 +146,10 @@ pub fn run() {
             ingest_workspace_graph,
             build_workspace_context_index,
             analyze_workspace_issue,
-            apply_patch_to_workspace
+            apply_patch_to_workspace,
+            detect_static_bugs,
+            full_security_scan,
+            apply_vulnerability_fix
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
